@@ -1,0 +1,147 @@
+import uuid
+from datetime import date, datetime, time
+from typing import Optional
+
+from pydantic import BaseModel
+
+
+class TimetableSlotCreate(BaseModel):
+    level_id: uuid.UUID
+    subject_id: uuid.UUID
+    teacher_id: uuid.UUID
+    batch_id: uuid.UUID
+    day_of_week: str
+    period_number: int
+    start_time: time
+    end_time: time
+
+
+class TimetableSlotOut(BaseModel):
+    id: uuid.UUID
+    level_id: uuid.UUID
+    subject_id: uuid.UUID
+    teacher_id: uuid.UUID
+    batch_id: uuid.UUID
+    day_of_week: str
+    period_number: int
+    start_time: time
+    end_time: time
+
+    class Config:
+        from_attributes = True
+
+
+class StudentAttendanceMarkItem(BaseModel):
+    student_user_id: uuid.UUID
+    status: str  # present | absent | late | excused
+
+
+class StudentAttendanceMarkRequest(BaseModel):
+    """Teacher marks attendance for their own students for one period."""
+    timetable_slot_id: uuid.UUID
+    subject_id: uuid.UUID
+    date: date
+    records: list[StudentAttendanceMarkItem]
+
+
+class TeacherAttendanceOverrideRequest(BaseModel):
+    """Coordinator manually marks/overrides a teacher's attendance for a period they never logged into."""
+    timetable_slot_id: uuid.UUID
+    subject_id: uuid.UUID
+    teacher_user_id: uuid.UUID
+    date: date
+    status: str
+
+
+class TeacherDailyLogEntry(BaseModel):
+    teacher_user_id: uuid.UUID
+    status: str  # present | absent | late | excused (UI's "Leave" maps to excused — see router note)
+
+
+class TeacherDailyLogRequest(BaseModel):
+    """Bulk save from the Teacher Attendance Registry screen — one status per
+    teacher, applied to every period that teacher has on this date."""
+    date: date
+    entries: list[TeacherDailyLogEntry]
+
+
+class TeacherDailyLogSkipped(BaseModel):
+    teacher_user_id: uuid.UUID
+    reason: str
+
+
+class TeacherDailyLogResult(BaseModel):
+    """What actually happened — since a teacher with zero periods that day
+    can't get an attendance_records row (timetable_slot_id is NOT NULL),
+    those are reported back as skipped rather than silently dropped."""
+    updated_teacher_ids: list[uuid.UUID]
+    skipped: list[TeacherDailyLogSkipped]
+
+
+class TeacherRosterEntry(BaseModel):
+    id: uuid.UUID
+    full_name: str
+
+
+class TeacherDailyStatusEntry(BaseModel):
+    teacher_user_id: uuid.UUID
+    full_name: str
+    period_count: int
+    status: Optional[str]  # None if no periods that day, or if periods disagree (mixed manual overrides)
+
+
+class AttendanceRecordOut(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    subject_id: uuid.UUID
+    timetable_slot_id: uuid.UUID
+    date: date
+    status: str
+    marked_by: uuid.UUID
+    source: str
+    marked_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AttendanceRecordDetailOut(BaseModel):
+    """Same as AttendanceRecordOut but with subject_name joined in —
+    the frontend log table needs a readable name, not just a UUID."""
+    id: uuid.UUID
+    subject_id: uuid.UUID
+    subject_name: str
+    date: date
+    status: str
+    timetable_slot_id: uuid.UUID
+
+
+class AttendanceSummaryOut(BaseModel):
+    """Per-subject aggregate for the Attendance Report card grid.
+    attendance_percentage counts 'late' as attended, consistent with how
+    most schools calculate it — flagged here since it's a judgment call,
+    not something the schema dictates."""
+    subject_id: uuid.UUID
+    subject_name: str
+    present_count: int
+    absent_count: int
+    late_count: int
+    excused_count: int
+    total_periods: int
+    attendance_percentage: float
+
+
+class TimetableSlotDetailOut(BaseModel):
+    """Same slot data as TimetableSlotOut but with subject_name and
+    teacher_name joined in — the slot-grid UI needs readable labels,
+    not raw UUIDs, to render each cell."""
+    id: uuid.UUID
+    subject_id: uuid.UUID
+    subject_name: str
+    teacher_id: uuid.UUID
+    teacher_name: str
+    batch_id: uuid.UUID
+    day_of_week: str
+    period_number: int
+    start_time: time
+    end_time: time
