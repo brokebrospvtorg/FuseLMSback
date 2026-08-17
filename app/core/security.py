@@ -43,8 +43,8 @@ def set_auth_cookie(response: Response, token: str) -> None:
         key=settings.COOKIE_NAME,
         value=token,
         httponly=True,
-        secure=settings.COOKIE_SECURE,
-        samesite="strict",
+        secure=True,          # was: settings.COOKIE_SECURE — force True; SameSite=None requires it
+        samesite="none",      # was: "strict" — required cross-domain (vercel.app ↔ railway.app)
         max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         path="/",
     )
