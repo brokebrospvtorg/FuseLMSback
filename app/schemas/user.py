@@ -20,12 +20,21 @@ class UserCreate(BaseModel):
     full_name: str
     email: EmailStr
     role: Literal["coordinator", "teacher", "student", "parent"]
+    phone_number: Optional[str] = None
     # Student-only optional fields at creation time:
     roll_number: Optional[str] = None
     admission_date: Optional[date] = None
-    # Teacher-only optional fields:
+    father_name: Optional[str] = None
+    date_of_birth: Optional[date] = None
+    gender: Optional[str] = None
+    religion: Optional[str] = None
+    nationality: Optional[str] = None
+    cnic: Optional[str] = None
+    registration_id: Optional[str] = None
+    # Teacher-only optional fields (gender/cnic reused above, shared shape):
     designation: Optional[str] = None
     hire_date: Optional[date] = None
+    teacher_code: Optional[str] = None
     # Student-only: link to an existing parent user
     parent_id: Optional[uuid.UUID] = None
     relationship_label: Optional[str] = None
@@ -38,6 +47,24 @@ class UserUpdate(BaseModel):
     # 5.3: role reassignment. Same restriction as creation — Admin accounts
     # are never created OR reassigned through the API, so "admin" isn't a
     # valid value here either (Pydantic-level, same as UserCreate.role).
+    phone_number: Optional[str] = None
+    # Registry-detail editing (Coordinator/Admin, per spec module 2). All
+    # optional and role-agnostic at the schema level — users.py only writes
+    # the ones that actually apply to the target user's current role, and
+    # silently ignores the rest rather than erroring, so the same PATCH
+    # body works regardless of which profile type is on the other end.
+    roll_number: Optional[str] = None
+    admission_date: Optional[date] = None
+    father_name: Optional[str] = None
+    date_of_birth: Optional[date] = None
+    gender: Optional[str] = None
+    religion: Optional[str] = None
+    nationality: Optional[str] = None
+    cnic: Optional[str] = None
+    registration_id: Optional[str] = None
+    designation: Optional[str] = None
+    hire_date: Optional[date] = None
+    teacher_code: Optional[str] = None
 
 
 class UserOut(BaseModel):
@@ -46,6 +73,7 @@ class UserOut(BaseModel):
     email: str
     role: str
     status: str
+    phone_number: Optional[str] = None
     created_by: Optional[uuid.UUID] = None
     last_login_at: Optional[datetime] = None
     created_at: datetime
@@ -58,6 +86,13 @@ class StudentProfileOut(BaseModel):
     user_id: uuid.UUID
     roll_number: Optional[str]
     admission_date: Optional[date]
+    father_name: Optional[str] = None
+    date_of_birth: Optional[date] = None
+    gender: Optional[str] = None
+    religion: Optional[str] = None
+    nationality: Optional[str] = None
+    cnic: Optional[str] = None
+    registration_id: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -67,9 +102,31 @@ class TeacherProfileOut(BaseModel):
     user_id: uuid.UUID
     designation: Optional[str]
     hire_date: Optional[date]
+    gender: Optional[str] = None
+    cnic: Optional[str] = None
+    teacher_code: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+
+class ParentProfileOut(BaseModel):
+    user_id: uuid.UUID
+    cnic: Optional[str] = None
+    registration_id: Optional[str] = None
+    registration_date: Optional[date] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserDetailOut(UserOut):
+    """UserOut + whichever profile table applies to this user's role — this
+    is what the Registry's "Edit Details" screen fetches so it has every
+    editable field in one call instead of the list summary alone."""
+    student_profile: Optional[StudentProfileOut] = None
+    teacher_profile: Optional[TeacherProfileOut] = None
+    parent_profile: Optional[ParentProfileOut] = None
 
 
 class ParentStudentLinkCreate(BaseModel):
@@ -87,6 +144,17 @@ class ParentStudentLinkOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ParentChildRegistryOut(BaseModel):
+    """Registry-display shape for GET /api/users/{parent_id}/children —
+    same fields as parent.py's ParentChildOut (the parent-self-facing
+    version), duplicated here rather than imported across router modules
+    to keep users.py's schema surface self-contained."""
+    student_id: uuid.UUID
+    full_name: str
+    roll_number: Optional[str] = None
+    relationship: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -117,15 +185,16 @@ class CorrectionRequestOut(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Composite "me" profile — what the student dashboard's Profile card needs.
-# NOTE: only covers fields that actually exist in the schema (name, roll
-# number, admission date, current class/level). Father's name, CNIC, DOB,
-# gender, religion, nationality, and department have no backing columns
-# anywhere in the 26-table schema — they are intentionally left off this
-# response rather than faked. See chat for the flag on this. ("Marital
-# Status" was also dropped from the placeholder list — not applicable for
-# school students, and never had a backing column either.)
+# UPDATE (schema_update.sql applied): father's name, DOB, gender, religion,
+# nationality, and CNIC now DO have backing columns (student_profiles /
+# teacher_profiles / parent_profiles) — the "intentionally left off, no
+# backing column" note from before this migration no longer applies.
+# "Department" was never a real field for anyone and stays off deliberately
+# — it was a frontend-only placeholder that should be removed, not wired up.
 # ---------------------------------------------------------------------------
 class MyProfileOut(BaseModel):
     user: UserOut
     student_profile: Optional[StudentProfileOut] = None
+    teacher_profile: Optional[TeacherProfileOut] = None
+    parent_profile: Optional[ParentProfileOut] = None
     class_name: Optional[str] = None

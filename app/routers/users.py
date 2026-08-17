@@ -11,12 +11,12 @@ from app.core.security import generate_verification_token
 from app.core.config import settings
 from app.core.audit import log_action
 from app.models import (
-    User, StudentProfile, TeacherProfile, ParentStudentLink,
+    User, StudentProfile, TeacherProfile, ParentProfile, ParentStudentLink,
     VerificationToken, CorrectionRequest, StudentLevelEnrollment, Level,
 )
 from app.schemas.user import (
-    UserCreate, UserUpdate, UserOut, StudentProfileOut, TeacherProfileOut,
-    ParentStudentLinkCreate, ParentStudentLinkOut,
+    UserCreate, UserUpdate, UserOut, UserDetailOut, StudentProfileOut, TeacherProfileOut, ParentProfileOut,
+    ParentStudentLinkCreate, ParentStudentLinkOut, ParentChildRegistryOut,
     CorrectionRequestCreate, CorrectionRequestReview, CorrectionRequestOut,
     MyProfileOut,
 )
@@ -40,7 +40,19 @@ def create_user(
     Creating an Admin account is not possible through this endpoint for
     either role — payload.role is a Literal at the schema level that
     doesn't include "admin" at all, so that case never reaches here.
+
+    Hierarchy rule (explicit decision): Admin assigns Coordinator;
+    Coordinator assigns Teacher/Student/Parent; Admin can do all of it.
+    A Coordinator creating another Coordinator was previously allowed by
+    accident — the Literal excluded "admin" but not "coordinator" — fixed
+    below.
     """
+    if payload.role == "coordinator" and current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Admin can create Coordinator accounts",
+        )
+
     existing = db.query(User).filter(User.email == payload.email, User.deleted_at.is_(None)).first()
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already in use")
@@ -50,6 +62,7 @@ def create_user(
         email=payload.email,
         role=payload.role,
         status="pending",
+        phone_number=payload.phone_number,
         created_by=current_user.id,
     )
     db.add(user)
@@ -60,6 +73,13 @@ def create_user(
             user_id=user.id,
             roll_number=payload.roll_number,
             admission_date=payload.admission_date,
+            father_name=payload.father_name,
+            date_of_birth=payload.date_of_birth,
+            gender=payload.gender,
+            religion=payload.religion,
+            nationality=payload.nationality,
+            cnic=payload.cnic,
+            registration_id=payload.registration_id,
         ))
         if payload.parent_id:
             parent = db.query(User).filter(
@@ -73,11 +93,16 @@ def create_user(
     elif payload.role == "teacher":
         db.add(TeacherProfile(
             user_id=user.id, designation=payload.designation, hire_date=payload.hire_date,
+            gender=payload.gender, cnic=payload.cnic, teacher_code=payload.teacher_code,
         ))
-    # coordinator and parent: no dedicated profile table for either — the
-    # users row itself (role='coordinator' / role='parent') is the whole
-    # record. Parent<->Student linking, when the parent is created first,
-    # happens separately via POST /api/users/parent-links.
+    elif payload.role == "parent":
+        db.add(ParentProfile(
+            user_id=user.id, cnic=payload.cnic, registration_id=payload.registration_id,
+        ))
+    # coordinator: no dedicated profile table — the users row itself
+    # (role='coordinator') is the whole record. Parent<->Student linking,
+    # when the parent is created first, happens separately via
+    # POST /api/users/parent-links.
 
     token_str = generate_verification_token()
     vt = VerificationToken(
@@ -115,7 +140,7 @@ def list_users(
     return query.order_by(User.created_at.desc()).all()
 
 
-@router.get("/{user_id}", response_model=UserOut)
+@router.get("/{user_id}", response_model=UserDetailOut)
 def get_user(
     user_id: uuid.UUID,
     db: Session = Depends(get_db),
@@ -132,7 +157,18 @@ def get_user(
     user = db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    return user
+
+    detail = UserDetailOut.model_validate(user)
+    if user.role == "student":
+        sp = db.query(StudentProfile).filter(StudentProfile.user_id == user.id).first()
+        detail.student_profile = StudentProfileOut.model_validate(sp) if sp else None
+    elif user.role == "teacher":
+        tp = db.query(TeacherProfile).filter(TeacherProfile.user_id == user.id).first()
+        detail.teacher_profile = TeacherProfileOut.model_validate(tp) if tp else None
+    elif user.role == "parent":
+        pp = db.query(ParentProfile).filter(ParentProfile.user_id == user.id).first()
+        detail.parent_profile = ParentProfileOut.model_validate(pp) if pp else None
+    return detail
 
 
 @router.patch("/{user_id}", response_model=UserOut)
@@ -144,19 +180,39 @@ def update_user(
 ):
     """
     5.3: full_name, status (suspend/reactivate), and role reassignment.
+    Registry-details sprint: also writes whichever profile-table fields
+    apply to the user's CURRENT role (spec: "Coordinator can edit these
+    details" — module 2). Fields for a role that doesn't apply to this user
+    are accepted by the schema (kept role-agnostic there) but silently
+    ignored here rather than erroring, so the frontend can send one PATCH
+    body without needing to know which profile type it's editing.
+
     Permission mirrors account creation (5.1) — Admin and Coordinator both
     reach this endpoint, neither can touch an Admin account's role or turn
     anyone into one (payload.role is a Literal that excludes "admin"
     entirely), and nobody can change their own role through here.
+
+    Hierarchy rule: same as create_user — only Admin can promote/reassign
+    someone TO Coordinator. A Coordinator can still reassign a user AWAY
+    from Coordinator (e.g. demoting to Teacher) since that's a step down,
+    not an escalation.
     """
     user = db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
+    if payload.role == "coordinator" and current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Admin can assign the Coordinator role",
+        )
+
     old_value = {"full_name": user.full_name, "status": user.status, "role": user.role}
 
     if payload.full_name is not None:
         user.full_name = payload.full_name
+    if payload.phone_number is not None:
+        user.phone_number = payload.phone_number
 
     if payload.status is not None:
         if payload.status not in ("active", "suspended"):
@@ -184,6 +240,36 @@ def update_user(
                 exists = db.query(TeacherProfile).filter(TeacherProfile.user_id == user.id).first()
                 if not exists:
                     db.add(TeacherProfile(user_id=user.id, designation=None, hire_date=None))
+            elif payload.role == "parent":
+                exists = db.query(ParentProfile).filter(ParentProfile.user_id == user.id).first()
+                if not exists:
+                    db.add(ParentProfile(user_id=user.id))
+
+    # Registry-detail edits — role read AFTER any reassignment above, so a
+    # combined "switch role + fill in the new role's details" PATCH in one
+    # call writes to the right table.
+    if user.role == "student":
+        sp = db.query(StudentProfile).filter(StudentProfile.user_id == user.id).first()
+        if sp:
+            for field in ("roll_number", "admission_date", "father_name", "date_of_birth",
+                          "gender", "religion", "nationality", "cnic", "registration_id"):
+                value = getattr(payload, field)
+                if value is not None:
+                    setattr(sp, field, value)
+    elif user.role == "teacher":
+        tp = db.query(TeacherProfile).filter(TeacherProfile.user_id == user.id).first()
+        if tp:
+            for field in ("designation", "hire_date", "gender", "cnic", "teacher_code"):
+                value = getattr(payload, field)
+                if value is not None:
+                    setattr(tp, field, value)
+    elif user.role == "parent":
+        pp = db.query(ParentProfile).filter(ParentProfile.user_id == user.id).first()
+        if pp:
+            for field in ("cnic", "registration_id"):
+                value = getattr(payload, field)
+                if value is not None:
+                    setattr(pp, field, value)
 
     log_action(db, current_user.id, "user_updated", "users", user.id, old_value,
                {"full_name": user.full_name, "status": user.status, "role": user.role})
@@ -232,6 +318,42 @@ def list_parents_for_student(
     return db.query(ParentStudentLink).filter(
         ParentStudentLink.student_id == student_id, ParentStudentLink.deleted_at.is_(None)
     ).all()
+
+
+@router.get("/{parent_id}/children", response_model=List[ParentChildRegistryOut])
+def list_children_for_parent(
+    parent_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "coordinator")),
+):
+    """
+    Information Registry (spec module 2): "Parent info... child ID and name."
+    Reverse direction of list_parents_for_student above. Deliberately
+    Admin/Coordinator-only and separate from GET /api/parent/children (which
+    is parent-self-scoped, require_roles("parent") only, and returns their
+    OWN children) — this is the registry-viewing path for looking up any
+    parent's children by ID, not a "my children" endpoint.
+    """
+    rows = (
+        db.query(ParentStudentLink, User, StudentProfile)
+        .join(User, User.id == ParentStudentLink.student_id)
+        .outerjoin(StudentProfile, StudentProfile.user_id == User.id)
+        .filter(
+            ParentStudentLink.parent_id == parent_id,
+            ParentStudentLink.deleted_at.is_(None),
+            User.deleted_at.is_(None),
+        )
+        .order_by(User.full_name)
+        .all()
+    )
+    return [
+        ParentChildRegistryOut(
+            student_id=user.id, full_name=user.full_name,
+            roll_number=profile.roll_number if profile else None,
+            relationship=link.relationship_label,
+        )
+        for link, user, profile in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

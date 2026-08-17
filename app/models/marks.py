@@ -31,6 +31,27 @@ class Mark(Base):
     deleted_at = Column(TIMESTAMP(timezone=True))
 
 
+class MarkEditRequest(Base):
+    """Teacher requests a change to marks that are already locked (saved);
+    Coordinator (or Admin) approves/rejects. Same shape/flow as
+    CorrectionRequest in models/user.py — status is plain TEXT + a CHECK
+    constraint (schema_update.sql), not a PG enum, so no PGEnum wrapper here
+    (matches how the column was actually created)."""
+    __tablename__ = "mark_edit_requests"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    mark_id = Column(UUID(as_uuid=True), ForeignKey("marks.id"), nullable=False)
+    requested_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    requested_change = Column(JSONB, nullable=False)
+    reason = Column(Text)
+    status = Column(Text, nullable=False, server_default="pending")
+    reviewed_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    reviewed_at = Column(TIMESTAMP(timezone=True))
+    review_note = Column(Text)
+    deleted_at = Column(TIMESTAMP(timezone=True))
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+
 class GradingScheme(Base):
     __tablename__ = "grading_schemes"
 

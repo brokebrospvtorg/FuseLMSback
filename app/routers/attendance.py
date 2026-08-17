@@ -8,12 +8,13 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_roles, check_license
-from app.models import AttendanceRecord, TimetableSlot, User, Subject
+from app.models import AttendanceRecord, TimetableSlot, User, Subject, Enrollment
 from app.schemas.attendance import (
     StudentAttendanceMarkRequest, TeacherAttendanceOverrideRequest, AttendanceRecordOut,
-    AttendanceRecordDetailOut, AttendanceSummaryOut,
+    AttendanceRecordDetailOut, AttendanceSummaryOut, PeriodRecordOut,
     TeacherDailyLogRequest, TeacherDailyLogResult, TeacherDailyLogSkipped,
     TeacherRosterEntry, TeacherDailyStatusEntry,
+    CoordinatorRosterEntry, CoordinatorStudentOverrideRequest,
 )
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"], dependencies=[Depends(check_license)])
@@ -83,6 +84,38 @@ def mark_student_attendance(
     return created
 
 
+@router.get("/my-period-records", response_model=List[PeriodRecordOut])
+def get_my_period_records(
+    timetable_slot_id: uuid.UUID,
+    date: date_type,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("teacher")),
+):
+    """
+    Sub-Sprint 3.2 — lets the Teacher's Mark Attendance screen check
+    whether a period+date was already submitted (so it can render a
+    locked, read-only view instead of the editable grid), and lets a
+    past date be inspected read-only. Excludes the teacher's own
+    auto-marked row — this is student records only.
+    """
+    slot = db.query(TimetableSlot).filter(
+        TimetableSlot.id == timetable_slot_id, TimetableSlot.deleted_at.is_(None)
+    ).first()
+    if not slot or slot.teacher_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your timetable slot")
+
+    records = db.query(AttendanceRecord).filter(
+        AttendanceRecord.timetable_slot_id == timetable_slot_id,
+        AttendanceRecord.date == date,
+        AttendanceRecord.user_id != current_user.id,
+        AttendanceRecord.deleted_at.is_(None),
+    ).all()
+    return [
+        PeriodRecordOut(student_user_id=r.user_id, status=r.status, marked_at=r.marked_at)
+        for r in records
+    ]
+
+
 @router.get("/teacher-gaps", response_model=List[dict])
 def teacher_periods_without_records(
     date: date_type,
@@ -117,6 +150,110 @@ def teacher_periods_without_records(
                 "end_time": str(slot.end_time),
             })
     return gaps
+
+
+@router.get("/coordinator/roster", response_model=List[CoordinatorRosterEntry])
+def coordinator_student_roster(
+    timetable_slot_id: uuid.UUID,
+    date: date_type,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "coordinator")),
+):
+    """
+    Sub-Sprint 3 (Coordinator Portal): the Teacher's own roster fetch
+    (`/my-period-records`) is locked to `slot.teacher_id == current_user.id`
+    — which is exactly right for a Teacher, but means there was previously
+    NO way for a Coordinator to pull up a class roster at all, for either a
+    slot the teacher skipped entirely or one they already submitted. This
+    is the roster-only half of "edit capability for previous dates' student
+    attendance, bypassing the teacher lock" — every enrolled student for
+    the slot's subject+batch, with whatever attendance status already
+    exists for this date (None if nothing recorded yet).
+    """
+    slot = db.query(TimetableSlot).filter(
+        TimetableSlot.id == timetable_slot_id, TimetableSlot.deleted_at.is_(None)
+    ).first()
+    if not slot:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Timetable slot not found")
+
+    students = (
+        db.query(User)
+        .join(Enrollment, Enrollment.student_id == User.id)
+        .filter(
+            Enrollment.subject_id == slot.subject_id,
+            Enrollment.batch_id == slot.batch_id,
+            Enrollment.status == "active",
+            Enrollment.deleted_at.is_(None),
+            User.deleted_at.is_(None),
+        )
+        .order_by(User.full_name)
+        .all()
+    )
+    existing = {
+        r.user_id: r.status
+        for r in db.query(AttendanceRecord).filter(
+            AttendanceRecord.timetable_slot_id == timetable_slot_id,
+            AttendanceRecord.date == date,
+            AttendanceRecord.deleted_at.is_(None),
+        ).all()
+    }
+    return [
+        CoordinatorRosterEntry(student_user_id=s.id, full_name=s.full_name, status=existing.get(s.id))
+        for s in students
+    ]
+
+
+@router.post("/coordinator/override-students", response_model=List[AttendanceRecordOut])
+def coordinator_override_student_attendance(
+    payload: CoordinatorStudentOverrideRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "coordinator")),
+):
+    """
+    The write half of the same gap: Teacher's `/mark-students` is
+    role-locked to Teacher AND, once saved, the Teacher's own frontend
+    treats that period as read-only going forward (no lock flag on the DB
+    row itself — the lock is enforced by which endpoint can write to it).
+    This endpoint is that bypass, scoped to Admin/Coordinator only, for any
+    date past or present. Deliberately does NOT touch the teacher's own
+    auto-marked attendance row for this slot — that's edited separately via
+    POST /api/attendance/teacher-override, so a Coordinator correcting a
+    student's mistaken entry doesn't accidentally reset the teacher's mark.
+    """
+    slot = db.query(TimetableSlot).filter(
+        TimetableSlot.id == payload.timetable_slot_id, TimetableSlot.deleted_at.is_(None)
+    ).first()
+    if not slot:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Timetable slot not found")
+
+    saved: List[AttendanceRecord] = []
+    for item in payload.records:
+        existing = db.query(AttendanceRecord).filter(
+            AttendanceRecord.user_id == item.student_user_id,
+            AttendanceRecord.timetable_slot_id == payload.timetable_slot_id,
+            AttendanceRecord.date == payload.date,
+        ).first()
+        if existing:
+            existing.status = item.status
+            existing.marked_by = current_user.id
+            saved.append(existing)
+        else:
+            record = AttendanceRecord(
+                user_id=item.student_user_id,
+                subject_id=payload.subject_id,
+                timetable_slot_id=payload.timetable_slot_id,
+                date=payload.date,
+                status=item.status,
+                marked_by=current_user.id,
+                source="manual",
+            )
+            db.add(record)
+            saved.append(record)
+
+    db.commit()
+    for r in saved:
+        db.refresh(r)
+    return saved
 
 
 @router.post("/teacher-override", response_model=AttendanceRecordOut, status_code=status.HTTP_201_CREATED)

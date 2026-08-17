@@ -18,6 +18,24 @@ class FeeVoucher(Base):
     # No status column: derived at query time from the latest non-deleted fee_proofs row
 
 
+class FeeStructure(Base):
+    """Admin Sub-Sprint 4: 'set subject/student fee bills using preset
+    layouts.' Table existed since an early migration but had zero backend
+    or frontend before this — voucher amounts were presumably being set
+    manually on FeeVoucherCreate with no reusable default. NULL student_id
+    = the subject's default fee for everyone; a non-NULL student_id is a
+    per-student override, checked first when generating a voucher."""
+    __tablename__ = "fee_structures"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    subject_id = Column(UUID(as_uuid=True), ForeignKey("subjects.id"), nullable=False)
+    student_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    amount = Column(Numeric, nullable=False)
+    set_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    deleted_at = Column(TIMESTAMP(timezone=True))
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+
 class FeeProof(Base):
     __tablename__ = "fee_proofs"
 

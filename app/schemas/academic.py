@@ -148,6 +148,20 @@ class TeacherSubjectAssignmentOut(BaseModel):
         from_attributes = True
 
 
+class TeacherAssignmentRegistryOut(BaseModel):
+    """Registry-display variant of TeacherSubjectAssignmentOut, with subject_name
+    and batch_name joined in — added for the Information Registry's "classes
+    taught, subjects taught" field (module 2 of the spec). Kept as a separate
+    schema/endpoint rather than changing TeacherSubjectAssignmentOut itself,
+    since that one is the response shape for POST /teacher-assignments and the
+    existing GET list — no reason to force every caller of those to carry
+    joined display fields they don't need."""
+    subject_id: uuid.UUID
+    subject_name: str
+    batch_id: uuid.UUID
+    batch_name: str
+
+
 # ---------------------------------------------------------------------------
 # Student "me" views — enriched with joined display fields (subject_name,
 # teacher_name) so the frontend doesn't need a second round-trip per row.

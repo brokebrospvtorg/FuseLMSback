@@ -13,6 +13,16 @@ class AssessmentCreate(BaseModel):
     max_marks: Decimal
 
 
+class AssessmentUpdate(BaseModel):
+    """Coordinator/Admin direct-edit — deliberately narrower than
+    AssessmentCreate: subject_id/batch_id/status aren't editable here
+    (moving an assessment between classes, or un-publishing one that
+    students may have already seen, are separate decisions this endpoint
+    doesn't make for you)."""
+    name: Optional[str] = None
+    max_marks: Optional[Decimal] = None
+
+
 class AssessmentOut(BaseModel):
     id: uuid.UUID
     subject_id: uuid.UUID
@@ -42,6 +52,46 @@ class MarkOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class MarkEditRequestCreate(BaseModel):
+    requested_change: dict  # e.g. {"marks_obtained": 82}
+    reason: Optional[str] = None
+
+
+class MarkEditRequestReview(BaseModel):
+    status: str  # approved | rejected
+    # Coordinator/Admin's note when approving/rejecting — same optional
+    # reviewer-note pattern as FeeProofReview.rejection_reason and
+    # ComplaintUpdate.resolution_message.
+    review_note: Optional[str] = None
+
+
+class MarkEditRequestOut(BaseModel):
+    id: uuid.UUID
+    mark_id: uuid.UUID
+    requested_by: uuid.UUID
+    requested_change: dict
+    reason: Optional[str] = None
+    status: str
+    reviewed_by: Optional[uuid.UUID] = None
+    reviewed_at: Optional[datetime] = None
+    review_note: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MarkEditRequestWithContextOut(MarkEditRequestOut):
+    """Sub-Sprint 5.2's status-tracking list needs more than raw IDs to be
+    readable — subject/assessment/student names, plus what the mark is
+    currently set to, so the Teacher can see "before" next to "requested"
+    without a second round-trip per row."""
+    assessment_name: str
+    subject_name: str
+    student_name: str
+    current_marks_obtained: Decimal
 
 
 class GradingSchemeCreate(BaseModel):

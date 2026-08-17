@@ -65,7 +65,7 @@ YoutubeVisibility = PGEnum(
     name="youtube_visibility", create_type=False,
 )
 ComplaintStatus = PGEnum(
-    "open", "in_progress", "resolved",
+    "open", "in_progress", "resolved", "closed",
     name="complaint_status", create_type=False,
 )
 NotificationChannel = PGEnum(

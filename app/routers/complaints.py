@@ -7,30 +7,80 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_roles, check_license
+from app.core.notifications import notify
 from app.models import Complaint, ParentStudentLink, User
 from app.schemas.communication import ComplaintCreate, ComplaintUpdate, ComplaintOut
 
 router = APIRouter(prefix="/api/complaints", tags=["complaints"], dependencies=[Depends(check_license)])
 
 
+def _complaint_out(db: Session, complaint: Complaint) -> ComplaintOut:
+    """Joins in submitter/student names — ComplaintOut needs them (the
+    Coordinator's resolution center shows who filed each complaint, not a
+    raw UUID), same convention as SubjectRequestReviewRow."""
+    submitter = db.query(User).filter(User.id == complaint.submitted_by).first()
+    student = None
+    if complaint.student_id and complaint.student_id != complaint.submitted_by:
+        student = db.query(User).filter(User.id == complaint.student_id).first()
+    elif complaint.student_id:
+        student = submitter
+
+    return ComplaintOut(
+        id=complaint.id,
+        submitted_by=complaint.submitted_by,
+        submitted_by_name=submitter.full_name if submitter else "Unknown",
+        submitted_by_role=submitter.role if submitter else "unknown",
+        student_id=complaint.student_id,
+        student_name=student.full_name if student else None,
+        subject_of_complaint=complaint.subject_of_complaint,
+        description=complaint.description,
+        status=complaint.status,
+        resolved_by=complaint.resolved_by,
+        resolved_at=complaint.resolved_at,
+        resolution_message=complaint.resolution_message,
+        created_at=complaint.created_at,
+    )
+
+
 @router.post("", response_model=ComplaintOut, status_code=status.HTTP_201_CREATED)
 def submit_complaint(payload: ComplaintCreate, db: Session = Depends(get_db),
-                      current_user: User = Depends(require_roles("student", "parent"))):
+                      current_user: User = Depends(require_roles("student", "parent", "teacher"))):
     if current_user.role == "student" and current_user.id != payload.student_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Students may only submit on their own behalf")
     if current_user.role == "parent":
+        if not payload.student_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="student_id is required for a Parent submission")
         link = db.query(ParentStudentLink).filter(
             ParentStudentLink.parent_id == current_user.id, ParentStudentLink.student_id == payload.student_id,
             ParentStudentLink.deleted_at.is_(None),
         ).first()
         if not link:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not linked to this student")
+    if current_user.role == "teacher" and payload.student_id is not None:
+        # A Teacher's feedback/complaint (Sub-Sprint 6.2) is general — about
+        # a timetable clash, a policy question, etc — not about one student.
+        # Reject rather than silently drop it, so the caller notices if it
+        # meant to submit a Student/Parent-style complaint instead.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                             detail="Teacher feedback isn't submitted on behalf of a specific student")
 
     complaint = Complaint(submitted_by=current_user.id, **payload.model_dump())
     db.add(complaint)
     db.commit()
     db.refresh(complaint)
-    return complaint
+
+    # Visible to both Coordinator and Admin (see list_complaints below) —
+    # notify every active one, same "no single owner" pattern as mark edit
+    # requests.
+    reviewers = db.query(User).filter(User.role.in_(["coordinator", "admin"]), User.deleted_at.is_(None)).all()
+    for reviewer in reviewers:
+        notify(
+            db, reviewer.id, "complaint_submitted",
+            f"{current_user.full_name} submitted a complaint/feedback: {payload.subject_of_complaint or payload.description[:60]}",
+            related_entity_type="complaints", related_entity_id=complaint.id,
+        )
+    db.commit()
+    return _complaint_out(db, complaint)
 
 
 @router.get("", response_model=List[ComplaintOut])
@@ -42,11 +92,15 @@ def list_complaints(db: Session = Depends(get_db),
         pass
     elif current_user.role == "student":
         query = query.filter(Complaint.student_id == current_user.id)
-    elif current_user.role == "parent":
+    elif current_user.role in ("parent", "teacher"):
+        # Parent: complaints they filed on a child's behalf. Teacher: their
+        # own submitted feedback (Sub-Sprint 6.2's status-tracking list) —
+        # same shape, both keyed off who actually submitted it.
         query = query.filter(Complaint.submitted_by == current_user.id)
     else:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not permitted")
-    return query.order_by(Complaint.created_at.desc()).all()
+    complaints = query.order_by(Complaint.created_at.desc()).all()
+    return [_complaint_out(db, c) for c in complaints]
 
 
 @router.patch("/{complaint_id}", response_model=ComplaintOut)
@@ -55,13 +109,30 @@ def update_complaint_status(complaint_id: uuid.UUID, payload: ComplaintUpdate, d
     complaint = db.query(Complaint).filter(Complaint.id == complaint_id, Complaint.deleted_at.is_(None)).first()
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
-    if payload.status not in ("open", "in_progress", "resolved"):
+    if payload.status not in ("open", "in_progress", "resolved", "closed"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status")
 
     complaint.status = payload.status
-    if payload.status == "resolved":
+    if payload.resolution_message is not None:
+        complaint.resolution_message = payload.resolution_message
+    if payload.status in ("resolved", "closed"):
         complaint.resolved_by = current_user.id
         complaint.resolved_at = datetime.now(timezone.utc)
+
+    # "submitter notified at each status change" — per the Complaint
+    # Handling workflow doc. Wasn't wired up before this Sub-Sprint; every
+    # status transition now fires one, carrying the reply text if given.
+    submitter = db.query(User).filter(User.id == complaint.submitted_by).first()
+    if submitter:
+        message = f"Your complaint/feedback status changed to '{payload.status}'."
+        if payload.resolution_message:
+            message += f" {payload.resolution_message}"
+        notify(
+            db, submitter.id, "complaint_status_changed", message,
+            related_entity_type="complaints", related_entity_id=complaint.id,
+            email_to=submitter.email, email_subject="Your complaint/feedback was updated",
+        )
+
     db.commit()
     db.refresh(complaint)
-    return complaint
+    return _complaint_out(db, complaint)

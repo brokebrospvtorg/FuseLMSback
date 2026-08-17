@@ -46,3 +46,36 @@ class FeeProofOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ---------------------------------------------------------------------------
+# Fee Structures (Admin Sub-Sprint 4: "set subject/student fee bills using
+# preset layouts"). NULL student_id = subject-wide default; a non-NULL
+# student_id is a per-student override. The two partial unique indexes on
+# fee_structures (see schema_update.sql) already enforce "only one active
+# default per subject" and "only one active override per student+subject"
+# at the DB level — the router below relies on those rather than
+# re-checking uniqueness itself.
+# ---------------------------------------------------------------------------
+class FeeStructureCreate(BaseModel):
+    subject_id: uuid.UUID
+    student_id: Optional[uuid.UUID] = None  # None = subject-wide default
+    amount: Decimal
+
+
+class FeeStructureOut(BaseModel):
+    id: uuid.UUID
+    subject_id: uuid.UUID
+    subject_name: Optional[str] = None
+    student_id: Optional[uuid.UUID] = None
+    student_name: Optional[str] = None
+    amount: Decimal
+    set_by: uuid.UUID
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FeeStructureAmountUpdate(BaseModel):
+    amount: Decimal

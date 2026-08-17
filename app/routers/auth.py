@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from app.core.database import get_db
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, coerce_expiry_to_utc_datetime
 from app.core.limiter import limiter
 from app.core.security import (
     verify_password, hash_password, create_access_token,
@@ -26,9 +26,9 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 @limiter.limit("5/minute")
 def login(request: Request, payload: LoginRequest, response: Response, db: Session = Depends(get_db)):
     license_check = db.execute(text("SELECT license_expiry_date FROM system_settings WHERE id = 1")).fetchone()
-    if license_check:
-        expiry_date = license_check[0]
-        if datetime.now(timezone.utc) > expiry_date.replace(tzinfo=timezone.utc):
+    if license_check and license_check[0]:
+        expiry_date = coerce_expiry_to_utc_datetime(license_check[0])
+        if datetime.now(timezone.utc) > expiry_date:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
                 detail="System Locked: School core subscription has expired. Please contact administration."

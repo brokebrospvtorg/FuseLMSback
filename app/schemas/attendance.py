@@ -90,6 +90,15 @@ class TeacherDailyStatusEntry(BaseModel):
     status: Optional[str]  # None if no periods that day, or if periods disagree (mixed manual overrides)
 
 
+class PeriodRecordOut(BaseModel):
+    """One student's existing record for a specific period+date — used by
+    the Teacher's Mark Attendance screen to detect 'already submitted' and
+    render a locked/read-only view instead of the editable grid."""
+    student_user_id: uuid.UUID
+    status: str
+    marked_at: datetime
+
+
 class AttendanceRecordOut(BaseModel):
     id: uuid.UUID
     user_id: uuid.UUID
@@ -132,16 +141,54 @@ class AttendanceSummaryOut(BaseModel):
 
 
 class TimetableSlotDetailOut(BaseModel):
-    """Same slot data as TimetableSlotOut but with subject_name and
-    teacher_name joined in — the slot-grid UI needs readable labels,
-    not raw UUIDs, to render each cell."""
+    """Same slot data as TimetableSlotOut but with subject_name, teacher_name,
+    and batch_name joined in — the slot-grid UI needs readable labels, not
+    raw UUIDs, to render each cell. batch_name added Sub-Sprint 6.1 for the
+    Teacher's weekly grid ("Class Name" column in the sprint plan)."""
     id: uuid.UUID
     subject_id: uuid.UUID
     subject_name: str
     teacher_id: uuid.UUID
     teacher_name: str
     batch_id: uuid.UUID
+    batch_name: str
     day_of_week: str
     period_number: int
     start_time: time
     end_time: time
+
+
+class CoordinatorRosterEntry(BaseModel):
+    """A student in a timetable slot's class, plus their current attendance
+    status for the given date (None if nothing recorded yet at all) — what
+    the Coordinator's edit screen renders as one editable row."""
+    student_user_id: uuid.UUID
+    full_name: str
+    status: Optional[str] = None
+
+
+class CoordinatorStudentOverrideRequest(BaseModel):
+    """Bulk upsert, no ownership restriction — this is the 'bypass the
+    teacher lock' path. Same shape as StudentAttendanceMarkRequest but
+    lives on its own endpoint (admin/coordinator only) rather than
+    overloading the Teacher's endpoint with a role branch."""
+    timetable_slot_id: uuid.UUID
+    subject_id: uuid.UUID
+    date: date
+    records: list[StudentAttendanceMarkItem]
+
+
+class TimetableSlotUpdate(BaseModel):
+    """Interactive Timetable Builder (Coordinator Portal Sub-Sprint 3) —
+    every field optional so a single PATCH can move a slot to a different
+    day/period, reassign the teacher, or retime it, without needing a
+    delete+recreate (which would also orphan any attendance already taken
+    against the old slot_id)."""
+    level_id: Optional[uuid.UUID] = None
+    subject_id: Optional[uuid.UUID] = None
+    teacher_id: Optional[uuid.UUID] = None
+    batch_id: Optional[uuid.UUID] = None
+    day_of_week: Optional[str] = None
+    period_number: Optional[int] = None
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None

@@ -1,5 +1,6 @@
 import uuid
-from datetime import datetime, timezone
+from decimal import Decimal
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -12,9 +13,10 @@ from app.core.dependencies import get_current_user, require_roles, check_license
 from app.core.audit import log_action
 from app.core.file_storage import save_fee_proof_file, resolve_fee_proof_path
 from app.core.notifications import notify
-from app.models import FeeVoucher, FeeProof, User, ParentStudentLink
+from app.models import FeeVoucher, FeeProof, User, ParentStudentLink, FeeStructure, Subject
 from app.schemas.fees import (
     FeeVoucherCreate, FeeVoucherOut, FeeProofReview, FeeProofOut,
+    FeeStructureCreate, FeeStructureOut, FeeStructureAmountUpdate,
 )
 
 router = APIRouter(prefix="/api/fees", tags=["fees"], dependencies=[Depends(check_license)])
@@ -76,7 +78,9 @@ def create_voucher(payload: FeeVoucherCreate, db: Session = Depends(get_db),
 
 
 @router.get("/vouchers", response_model=List[FeeVoucherOut])
-def list_vouchers(student_id: Optional[uuid.UUID] = None, db: Session = Depends(get_db),
+def list_vouchers(student_id: Optional[uuid.UUID] = None,
+                   months: Optional[int] = None,
+                   db: Session = Depends(get_db),
                    current_user: User = Depends(get_current_user)):
     """
     Admin/Coordinator with no student_id get every voucher (this is what
@@ -84,6 +88,11 @@ def list_vouchers(student_id: Optional[uuid.UUID] = None, db: Session = Depends(
     client-side since there's no server-side status column to filter on).
     Student/Parent are always scoped to their own/linked student(s)
     regardless of the student_id param.
+
+    `months` — Admin Sub-Sprint 4's "historical records with 3-month filter
+    drop-down." Optional and open-ended (any integer, not hardcoded to 3)
+    so the same param covers "last month" or "last 6 months" too; the
+    frontend's dropdown just happens to default to 3.
     """
     query = db.query(FeeVoucher).filter(FeeVoucher.deleted_at.is_(None))
     if current_user.role == "student":
@@ -95,6 +104,10 @@ def list_vouchers(student_id: Optional[uuid.UUID] = None, db: Session = Depends(
         query = query.filter(FeeVoucher.student_id.in_(linked_ids or [uuid.uuid4()]))
     elif student_id:
         query = query.filter(FeeVoucher.student_id == student_id)
+
+    if months:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=months * 30)
+        query = query.filter(FeeVoucher.generated_at >= cutoff)
 
     vouchers = query.order_by(FeeVoucher.due_date.desc()).all()
 
@@ -211,3 +224,83 @@ def review_fee_proof(proof_id: uuid.UUID, payload: FeeProofReview, db: Session =
     db.commit()
     db.refresh(proof)
     return proof
+
+
+# ---------------------------------------------------------------------------
+# Fee Structures — Admin Sub-Sprint 4: "set subject/student fee bills using
+# preset layouts." The table (fee_structures) existed since an early schema
+# migration but had zero backend before this — voucher creation had no
+# reusable default to pull from.
+# ---------------------------------------------------------------------------
+def _fee_structure_out(db: Session, fs: FeeStructure) -> FeeStructureOut:
+    subject = db.query(Subject).filter(Subject.id == fs.subject_id).first()
+    student = db.query(User).filter(User.id == fs.student_id).first() if fs.student_id else None
+    return FeeStructureOut(
+        id=fs.id, subject_id=fs.subject_id, subject_name=subject.name if subject else None,
+        student_id=fs.student_id, student_name=student.full_name if student else None,
+        amount=fs.amount, set_by=fs.set_by, created_at=fs.created_at,
+    )
+
+
+@router.get("/structures", response_model=List[FeeStructureOut])
+def list_fee_structures(subject_id: Optional[uuid.UUID] = None, db: Session = Depends(get_db),
+                         current_user: User = Depends(require_roles("admin", "coordinator"))):
+    query = db.query(FeeStructure).filter(FeeStructure.deleted_at.is_(None))
+    if subject_id:
+        query = query.filter(FeeStructure.subject_id == subject_id)
+    rows = query.order_by(FeeStructure.created_at.desc()).all()
+    return [_fee_structure_out(db, r) for r in rows]
+
+
+@router.post("/structures", response_model=FeeStructureOut, status_code=status.HTTP_201_CREATED)
+def create_fee_structure(payload: FeeStructureCreate, db: Session = Depends(get_db),
+                          current_user: User = Depends(require_roles("admin", "coordinator"))):
+    """
+    The two partial unique indexes on fee_structures (subject-wide default,
+    and per-student override) enforce "only one active row" at the DB
+    level — a second POST for the same subject (+ same student_id, or both
+    NULL) raises IntegrityError, which we translate to a clear 409 instead
+    of a raw DB error leaking through. To change an existing amount, use
+    PATCH, not a second POST.
+    """
+    fs = FeeStructure(**payload.model_dump(), set_by=current_user.id)
+    db.add(fs)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        scope = "this student" if payload.student_id else "the whole subject"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A fee is already set for {scope} on this subject — edit that one instead of creating a new one.",
+        )
+    db.refresh(fs)
+    log_action(db, current_user.id, "fee_structure_created", "fee_structures", fs.id, None,
+               {"subject_id": str(payload.subject_id), "student_id": str(payload.student_id) if payload.student_id else None, "amount": str(payload.amount)})
+    db.commit()
+    return _fee_structure_out(db, fs)
+
+
+@router.patch("/structures/{structure_id}", response_model=FeeStructureOut)
+def update_fee_structure(structure_id: uuid.UUID, payload: FeeStructureAmountUpdate, db: Session = Depends(get_db),
+                          current_user: User = Depends(require_roles("admin", "coordinator"))):
+    fs = db.query(FeeStructure).filter(FeeStructure.id == structure_id, FeeStructure.deleted_at.is_(None)).first()
+    if not fs:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee structure not found")
+    old_amount = fs.amount
+    fs.amount = payload.amount
+    log_action(db, current_user.id, "fee_structure_updated", "fee_structures", fs.id,
+               {"amount": str(old_amount)}, {"amount": str(payload.amount)})
+    db.commit()
+    db.refresh(fs)
+    return _fee_structure_out(db, fs)
+
+
+@router.delete("/structures/{structure_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_fee_structure(structure_id: uuid.UUID, db: Session = Depends(get_db),
+                          current_user: User = Depends(require_roles("admin", "coordinator"))):
+    fs = db.query(FeeStructure).filter(FeeStructure.id == structure_id, FeeStructure.deleted_at.is_(None)).first()
+    if not fs:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fee structure not found")
+    fs.deleted_at = datetime.now(timezone.utc)
+    db.commit()

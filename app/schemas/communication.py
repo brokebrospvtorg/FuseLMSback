@@ -6,24 +6,32 @@ from pydantic import BaseModel
 
 
 class ComplaintCreate(BaseModel):
-    student_id: uuid.UUID
+    # Optional as of Sub-Sprint 6: a Teacher submitting general feedback
+    # leaves this unset. Student/Parent submissions still provide it (the
+    # router still enforces that for those two roles).
+    student_id: Optional[uuid.UUID] = None
     subject_of_complaint: Optional[str] = None
     description: str
 
 
 class ComplaintUpdate(BaseModel):
-    status: str  # open | in_progress | resolved
+    status: str  # open | in_progress | resolved | closed
+    resolution_message: Optional[str] = None
 
 
 class ComplaintOut(BaseModel):
     id: uuid.UUID
     submitted_by: uuid.UUID
-    student_id: uuid.UUID
+    submitted_by_name: str
+    submitted_by_role: str
+    student_id: Optional[uuid.UUID] = None
+    student_name: Optional[str] = None
     subject_of_complaint: Optional[str]
     description: str
     status: str
     resolved_by: Optional[uuid.UUID]
     resolved_at: Optional[datetime]
+    resolution_message: Optional[str] = None
     created_at: datetime
 
     class Config:

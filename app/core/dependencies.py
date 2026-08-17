@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
@@ -7,6 +7,30 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import decode_access_token
 from app.models import User, SystemSettings
+
+
+def coerce_expiry_to_utc_datetime(value) -> datetime:
+    """
+    system_settings.license_expiry_date is declared TIMESTAMPTZ in the
+    SQLAlchemy model but the live schema (001_init_schema.sql, never
+    migrated) still has it as a plain DATE. Whichever type the physical
+    column actually is determines what psycopg2 hands back — a naive
+    datetime.date, a naive datetime.datetime, or a tz-aware datetime.datetime
+    — regardless of what the ORM column declares. This normalizes all three
+    to a tz-aware UTC datetime so callers can compare safely no matter which
+    state a given deployment's database is actually in.
+
+    The real fix is still the migration:
+        ALTER TABLE system_settings ALTER COLUMN license_expiry_date
+        TYPE TIMESTAMPTZ USING license_expiry_date::TIMESTAMPTZ;
+    This function makes the app not crash in the meantime — it doesn't
+    replace running that migration.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    raise TypeError(f"Unexpected type for license_expiry_date: {type(value)!r}")
 
 
 def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
@@ -59,9 +83,7 @@ def check_license(db: Session = Depends(get_db)) -> None:
     if not settings_row or not settings_row.license_expiry_date:
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="License not configured")
 
-    expiry = settings_row.license_expiry_date
-    if expiry.tzinfo is None:
-        expiry = expiry.replace(tzinfo=timezone.utc)
+    expiry = coerce_expiry_to_utc_datetime(settings_row.license_expiry_date)
 
     if datetime.now(timezone.utc) > expiry:
         raise HTTPException(

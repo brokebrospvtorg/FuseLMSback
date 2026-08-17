@@ -17,6 +17,7 @@ class User(Base):
     password_hash = Column(Text)
     role = Column(UserRole, nullable=False)
     status = Column(UserStatus, nullable=False, server_default="pending")
+    phone_number = Column(Text)
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     last_login_at = Column(TIMESTAMP(timezone=True))
     deleted_at = Column(TIMESTAMP(timezone=True))
@@ -25,6 +26,7 @@ class User(Base):
 
     student_profile = relationship("StudentProfile", back_populates="user", uselist=False)
     teacher_profile = relationship("TeacherProfile", back_populates="user", uselist=False)
+    parent_profile = relationship("ParentProfile", back_populates="user", uselist=False)
 
 
 class StudentProfile(Base):
@@ -33,6 +35,13 @@ class StudentProfile(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     roll_number = Column(Text, unique=True)
     admission_date = Column(Date)
+    father_name = Column(Text)
+    date_of_birth = Column(Date)
+    gender = Column(Text)
+    religion = Column(Text)
+    nationality = Column(Text)
+    cnic = Column(Text)
+    registration_id = Column(Text)
 
     user = relationship("User", back_populates="student_profile")
 
@@ -43,8 +52,22 @@ class TeacherProfile(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     designation = Column(Text)
     hire_date = Column(Date)
+    gender = Column(Text)
+    cnic = Column(Text)
+    teacher_code = Column(Text)
 
     user = relationship("User", back_populates="teacher_profile")
+
+
+class ParentProfile(Base):
+    __tablename__ = "parent_profiles"
+
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True)
+    cnic = Column(Text)
+    registration_id = Column(Text)
+    registration_date = Column(Date)
+
+    user = relationship("User", back_populates="parent_profile")
 
 
 class ParentStudentLink(Base):

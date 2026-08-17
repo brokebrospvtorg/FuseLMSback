@@ -17,7 +17,7 @@ from app.schemas.academic import (
     BatchCreate, BatchOut, LevelCreate, LevelOut, SubjectCreate, SubjectOut,
     StudentLevelEnrollmentCreate, StudentLevelEnrollmentOut,
     SubjectRequestCreate, SubjectRequestReview, SubjectRequestOut, EnrollmentOut,
-    TeacherSubjectAssignmentCreate, TeacherSubjectAssignmentOut,
+    TeacherSubjectAssignmentCreate, TeacherSubjectAssignmentOut, TeacherAssignmentRegistryOut,
     TimetableEntryOut, DashboardSummaryOut, SubjectRequestReviewRowOut,
 )
 
@@ -306,6 +306,36 @@ def list_teacher_assignments(teacher_id: Optional[uuid.UUID] = None, db: Session
     elif teacher_id:
         query = query.filter(TeacherSubjectAssignment.teacher_id == teacher_id)
     return query.all()
+
+
+@router.get("/teacher-assignments/registry", response_model=List[TeacherAssignmentRegistryOut])
+def teacher_assignments_for_registry(teacher_id: uuid.UUID, db: Session = Depends(get_db),
+                                      current_user: User = Depends(require_roles("admin", "coordinator"))):
+    """
+    Information Registry (spec module 2): "Teacher info stored... Classes
+    taught, subjects taught." Joined display variant of the endpoint above —
+    Admin/Coordinator only, since this is a registry-viewing feature, not
+    something a Teacher needs about themselves via this route (they'd use
+    the un-joined /teacher-assignments with no teacher_id, same as before).
+    """
+    rows = (
+        db.query(TeacherSubjectAssignment, Subject.name.label("subject_name"), Batch.name.label("batch_name"))
+        .join(Subject, Subject.id == TeacherSubjectAssignment.subject_id)
+        .join(Batch, Batch.id == TeacherSubjectAssignment.batch_id)
+        .filter(
+            TeacherSubjectAssignment.teacher_id == teacher_id,
+            TeacherSubjectAssignment.deleted_at.is_(None),
+        )
+        .order_by(Batch.year.desc(), Subject.name)
+        .all()
+    )
+    return [
+        TeacherAssignmentRegistryOut(
+            subject_id=assignment.subject_id, subject_name=subject_name,
+            batch_id=assignment.batch_id, batch_name=batch_name,
+        )
+        for assignment, subject_name, batch_name in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
