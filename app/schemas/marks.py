@@ -3,14 +3,18 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class AssessmentCreate(BaseModel):
     subject_id: uuid.UUID
     batch_id: uuid.UUID
     name: str
-    max_marks: Decimal
+    # gt=0: a zero/negative max_marks can't produce a meaningful percentage
+    # (see calculate_percentage's own zero-guard in core/grading.py, which
+    # exists as defense-in-depth for existing rows, not as license to allow
+    # new ones in here).
+    max_marks: Decimal = Field(..., gt=0)
 
 
 class AssessmentUpdate(BaseModel):
@@ -20,7 +24,7 @@ class AssessmentUpdate(BaseModel):
     students may have already seen, are separate decisions this endpoint
     doesn't make for you)."""
     name: Optional[str] = None
-    max_marks: Optional[Decimal] = None
+    max_marks: Optional[Decimal] = Field(default=None, gt=0)
 
 
 class AssessmentOut(BaseModel):
@@ -49,6 +53,12 @@ class MarkOut(BaseModel):
     marks_obtained: Decimal
     uploaded_by: uuid.UUID
     uploaded_at: datetime
+    # Mark Override refactor (schema_update_18): audit trail for a
+    # Coordinator/Admin correction via PATCH /marks/{mark_id}/mark-override.
+    # False/None for a mark that's only ever gone through the normal
+    # teacher upload/upsert path.
+    is_overridden: bool = False
+    overridden_by: Optional[uuid.UUID] = None
 
     class Config:
         from_attributes = True
@@ -96,9 +106,18 @@ class MarkEditRequestWithContextOut(MarkEditRequestOut):
 
 class GradingSchemeCreate(BaseModel):
     level_id: uuid.UUID
-    min_percentage: Decimal
-    max_percentage: Decimal
-    letter_grade: str
+    min_percentage: Decimal = Field(..., ge=0, le=100)
+    max_percentage: Decimal = Field(..., ge=0, le=100)
+    letter_grade: str = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "GradingSchemeCreate":
+        # A band where min > max can never match a computed percentage —
+        # that band (and every student who should fall in it) would
+        # silently never get this letter grade from this scheme.
+        if self.min_percentage > self.max_percentage:
+            raise ValueError("min_percentage cannot be greater than max_percentage")
+        return self
 
 
 class GradingSchemeOut(BaseModel):
@@ -112,8 +131,13 @@ class GradingSchemeOut(BaseModel):
         from_attributes = True
 
 
-class GradeOverrideRequest(BaseModel):
-    letter_grade: str
+class MarkOverrideRequest(BaseModel):
+    """Mark Override refactor (schema_update_18): body for PATCH
+    /api/academics/marks/{mark_id}/mark-override — replaces the removed
+    GradeOverrideRequest/PATCH .../grades/{id}/override. Corrects one
+    student's score on one assessment (not a subject-level letter grade);
+    the pooled percentage/grade is derived automatically afterwards."""
+    marks_obtained: Decimal
     override_reason: str = Field(..., min_length=1)
 
 
@@ -124,15 +148,18 @@ class RosterEntryOut(BaseModel):
 
 
 class GradeOut(BaseModel):
+    """Mark Override refactor (schema_update_18): Grade is now a purely
+    computed rollup — no is_overridden/overridden_by/override_reason here
+    anymore, since a Grade can no longer be overridden directly. To see
+    whether an individual assessment mark behind this percentage was
+    corrected, check MarkOut.is_overridden for that assessment via
+    GET /api/academics/assessments/{assessment_id}/marks."""
     id: uuid.UUID
     student_id: uuid.UUID
     subject_id: uuid.UUID
     batch_id: uuid.UUID
     computed_percentage: Optional[Decimal]
     letter_grade: Optional[str]
-    is_overridden: bool
-    overridden_by: Optional[uuid.UUID]
-    override_reason: Optional[str]
     last_computed_at: Optional[datetime]
 
     class Config:

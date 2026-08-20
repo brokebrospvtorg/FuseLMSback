@@ -30,13 +30,22 @@ class HelpingMaterialOut(BaseModel):
 
 
 class LectureCreate(BaseModel):
-    # Lectures Sub-Sprint 2 (YouTube): youtube_video_id removed from here —
-    # a lecture is now created empty and the video is set afterward via the
-    # dedicated POST .../youtube-video endpoint below, same two-step shape
-    # classroom_url already used (it was never part of this schema either).
+    # LMS & Study Resources refactor: Upload Lecture is a single step again —
+    # Title, Description, and YouTube Video Link are all submitted together.
+    # youtube_url accepts any recognized YouTube format (standard watch URL,
+    # youtu.be, Shorts, or Embed) or a bare 11-character video ID; the
+    # router parses it via parse_youtube_video_id() and 400s before a
+    # Lecture row is ever created if it doesn't resolve. The resulting
+    # youtube_video_id is locked immediately on creation, same as before —
+    # only *how* it gets set changed (one call instead of two).
+    #
+    # classroom_url is deliberately NOT here — Google Classroom is now a
+    # single per-Subject setting (see SubjectClassroomLinkCreate below),
+    # decoupled entirely from individual lecture uploads.
     subject_id: uuid.UUID
     title: str
     description: Optional[str] = None
+    youtube_url: str
 
 
 class LectureOut(BaseModel):
@@ -157,3 +166,34 @@ class YoutubeRequestReview(BaseModel):
     most useful on reject."""
     status: str  # approved | rejected
     review_note: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Subject-level Google Classroom link (LMS & Study Resources refactor)
+# One link per Subject, set once by a Teacher, then directly editable (no
+# lock/approval step — that distinction only ever applied to the legacy
+# per-lecture classroom_url, see ClassroomEditRequest above).
+# ---------------------------------------------------------------------------
+class SetSubjectClassroomLinkRequest(BaseModel):
+    """Initial set only. The router 409s if a link already exists for the
+    subject — use UpdateSubjectClassroomLinkRequest / PUT to change it."""
+    classroom_url: HttpUrl
+
+
+class UpdateSubjectClassroomLinkRequest(BaseModel):
+    """Direct edit of an already-set link — this is the 'Edit Google
+    Classroom Link' action; no reason/approval required."""
+    classroom_url: HttpUrl
+
+
+class SubjectClassroomLinkOut(BaseModel):
+    id: uuid.UUID
+    subject_id: uuid.UUID
+    subject_name: Optional[str] = None
+    classroom_url: str
+    set_by: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True

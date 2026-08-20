@@ -8,13 +8,14 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_roles, check_license
-from app.models import AttendanceRecord, TimetableSlot, User, Subject, Enrollment
+from app.models import AttendanceRecord, TimetableSlot, User, Subject, Enrollment, Level
 from app.schemas.attendance import (
     StudentAttendanceMarkRequest, TeacherAttendanceOverrideRequest, AttendanceRecordOut,
     AttendanceRecordDetailOut, AttendanceSummaryOut, PeriodRecordOut,
     TeacherDailyLogRequest, TeacherDailyLogResult, TeacherDailyLogSkipped,
     TeacherRosterEntry, TeacherDailyStatusEntry,
     CoordinatorRosterEntry, CoordinatorStudentOverrideRequest,
+    TeacherAttendanceLogEntry,
 )
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"], dependencies=[Depends(check_license)])
@@ -36,6 +37,17 @@ def mark_student_attendance(
     ).first()
     if not slot or slot.teacher_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your timetable slot")
+
+    # Strict current-date enforcement: a Teacher may only create or edit
+    # attendance (this endpoint upserts, so it covers both) for today.
+    # Past dates are read-only for the Teacher (view via /my-history-log or
+    # /my-period-records); corrections to past dates go through the
+    # Coordinator's override endpoints. Future dates aren't markable at all.
+    if payload.date != date_type.today():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Teachers can only mark or edit attendance for the current date.",
+        )
 
     created: List[AttendanceRecord] = []
     for item in payload.records:
@@ -113,6 +125,83 @@ def get_my_period_records(
     return [
         PeriodRecordOut(student_user_id=r.user_id, status=r.status, marked_at=r.marked_at)
         for r in records
+    ]
+
+
+@router.get("/my-history-log", response_model=List[TeacherAttendanceLogEntry])
+def get_my_attendance_history_log(
+    subject_id: Optional[uuid.UUID] = None,
+    level_id: Optional[uuid.UUID] = None,
+    date_from: Optional[date_type] = None,
+    date_to: Optional[date_type] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("teacher")),
+):
+    """
+    Day-Wise UI's "View Summary" — a read-only historical log of classes
+    this teacher has already taken (today or earlier only; marking is
+    locked to today, so there is nothing to summarize for future dates).
+    One row per period+date actually taught, with the student attendance
+    breakdown for that class, filterable by subject/level/date range.
+    """
+    today = date_type.today()
+    effective_date_to = min(date_to, today) if date_to else today
+
+    query = (
+        db.query(
+            AttendanceRecord.date,
+            AttendanceRecord.timetable_slot_id,
+            TimetableSlot.period_number,
+            AttendanceRecord.subject_id,
+            Subject.name.label("subject_name"),
+            Level.code.label("level_code"),
+            func.sum(case((AttendanceRecord.status == "present", 1), else_=0)).label("present_count"),
+            func.sum(case((AttendanceRecord.status == "absent", 1), else_=0)).label("absent_count"),
+            func.sum(case((AttendanceRecord.status == "late", 1), else_=0)).label("late_count"),
+            func.sum(case((AttendanceRecord.status == "excused", 1), else_=0)).label("excused_count"),
+            func.count(AttendanceRecord.id).label("total_students"),
+        )
+        .join(TimetableSlot, TimetableSlot.id == AttendanceRecord.timetable_slot_id)
+        .join(Subject, Subject.id == AttendanceRecord.subject_id)
+        .outerjoin(Level, Level.id == TimetableSlot.level_id)
+        .filter(
+            TimetableSlot.teacher_id == current_user.id,
+            AttendanceRecord.user_id != current_user.id,  # student rows only, not the teacher's own auto-mark
+            AttendanceRecord.deleted_at.is_(None),
+            AttendanceRecord.date <= effective_date_to,
+        )
+    )
+    if subject_id:
+        query = query.filter(AttendanceRecord.subject_id == subject_id)
+    if level_id:
+        query = query.filter(TimetableSlot.level_id == level_id)
+    if date_from:
+        query = query.filter(AttendanceRecord.date >= date_from)
+
+    rows = (
+        query.group_by(
+            AttendanceRecord.date, AttendanceRecord.timetable_slot_id, TimetableSlot.period_number,
+            AttendanceRecord.subject_id, Subject.name, Level.code,
+        )
+        .order_by(AttendanceRecord.date.desc(), TimetableSlot.period_number)
+        .all()
+    )
+
+    return [
+        TeacherAttendanceLogEntry(
+            date=r.date,
+            timetable_slot_id=r.timetable_slot_id,
+            period_number=r.period_number,
+            subject_id=r.subject_id,
+            subject_name=r.subject_name,
+            level_code=r.level_code,
+            present_count=r.present_count,
+            absent_count=r.absent_count,
+            late_count=r.late_count,
+            excused_count=r.excused_count,
+            total_students=r.total_students,
+        )
+        for r in rows
     ]
 
 
@@ -416,6 +505,7 @@ def my_attendance_summary(db: Session = Depends(get_db), current_user: User = De
         db.query(
             AttendanceRecord.subject_id,
             Subject.name.label("subject_name"),
+            Level.code.label("level_code"),
             func.sum(case((AttendanceRecord.status == "present", 1), else_=0)).label("present_count"),
             func.sum(case((AttendanceRecord.status == "absent", 1), else_=0)).label("absent_count"),
             func.sum(case((AttendanceRecord.status == "late", 1), else_=0)).label("late_count"),
@@ -423,8 +513,9 @@ def my_attendance_summary(db: Session = Depends(get_db), current_user: User = De
             func.count(AttendanceRecord.id).label("total_periods"),
         )
         .join(Subject, Subject.id == AttendanceRecord.subject_id)
+        .outerjoin(Level, Level.id == Subject.level_id)
         .filter(AttendanceRecord.user_id == current_user.id, AttendanceRecord.deleted_at.is_(None))
-        .group_by(AttendanceRecord.subject_id, Subject.name)
+        .group_by(AttendanceRecord.subject_id, Subject.name, Level.code)
         .order_by(Subject.name)
         .all()
     )
@@ -439,6 +530,7 @@ def my_attendance_summary(db: Session = Depends(get_db), current_user: User = De
         result.append(AttendanceSummaryOut(
             subject_id=r.subject_id,
             subject_name=r.subject_name,
+            level_code=r.level_code,
             present_count=r.present_count,
             absent_count=r.absent_count,
             late_count=r.late_count,

@@ -2,7 +2,9 @@ import uuid
 from datetime import date, datetime
 from typing import Optional, List, Literal
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+
+from app.schemas.common import BoardEnum
 
 
 # ---------------------------------------------------------------------------
@@ -31,13 +33,50 @@ class UserCreate(BaseModel):
     nationality: Optional[str] = None
     cnic: Optional[str] = None
     registration_id: Optional[str] = None
+    # Student-only, REQUIRED when role == "student" (validated below): the
+    # exam board this student is registered under. Optional at the schema
+    # level (same convention as every other role-specific field on this
+    # shared payload) so a Teacher/Parent/Coordinator payload isn't forced
+    # to carry a meaningless board value.
+    board: Optional[BoardEnum] = None
     # Teacher-only optional fields (gender/cnic reused above, shared shape):
     designation: Optional[str] = None
     hire_date: Optional[date] = None
     teacher_code: Optional[str] = None
+    # Teacher-only, REQUIRED (at least one) when role == "teacher": the
+    # board(s) this teacher is qualified to teach.
+    boards: Optional[List[BoardEnum]] = None
     # Student-only: link to an existing parent user
     parent_id: Optional[uuid.UUID] = None
     relationship_label: Optional[str] = None
+    # Optional: Admin/Coordinator sets the account's first password directly
+    # instead of the normal email-activation flow. When provided, the new
+    # user is created status='active' immediately (skips the pending/token
+    # step entirely) with must_change_password=True. When omitted (the
+    # default, unchanged from before this sprint), account creation works
+    # exactly as it did — status='pending', activation email sent, user
+    # picks their own first password.
+    initial_password: Optional[str] = Field(default=None, min_length=8)
+
+    @field_validator("boards")
+    @classmethod
+    def _dedupe_boards(cls, v: Optional[List[BoardEnum]]) -> Optional[List[BoardEnum]]:
+        if v is None:
+            return v
+        # Preserve first-seen order while dropping duplicates — a teacher
+        # multi-select shouldn't be able to submit the same board twice.
+        seen: dict[BoardEnum, None] = {}
+        for board in v:
+            seen.setdefault(board, None)
+        return list(seen.keys())
+
+    @model_validator(mode="after")
+    def _require_board_for_role(self) -> "UserCreate":
+        if self.role == "student" and self.board is None:
+            raise ValueError("board is required when creating a student")
+        if self.role == "teacher" and not self.boards:
+            raise ValueError("boards must include at least one board when creating a teacher")
+        return self
 
 
 class UserUpdate(BaseModel):
@@ -62,9 +101,40 @@ class UserUpdate(BaseModel):
     nationality: Optional[str] = None
     cnic: Optional[str] = None
     registration_id: Optional[str] = None
+    # Student-only: exam board (schema_update_11). Omit to leave unchanged;
+    # the Student edit form always sends it since it's a required field on
+    # that form, but it stays Optional here so a PATCH touching only other
+    # fields (e.g. suspend/reactivate) doesn't have to resend it.
+    board: Optional[BoardEnum] = None
     designation: Optional[str] = None
     hire_date: Optional[date] = None
     teacher_code: Optional[str] = None
+    # Teacher-only: full replacement of the boards this teacher is
+    # qualified to teach (schema_update_11) — send the complete desired
+    # list, not a delta, same convention as `subject_ids` below. An empty
+    # list is invalid for a teacher (a teacher must be qualified for at
+    # least one board); omit the field entirely to leave it unchanged.
+    boards: Optional[List[BoardEnum]] = None
+    # Student academic level + subject assignment (Admin User Management).
+    # Both optional/role-agnostic at the schema level, same convention as the
+    # rest of this class — users.py only applies them when the target user
+    # is a student, and silently ignores them otherwise. `subject_ids` is a
+    # full replacement of the student's active subject set for the current
+    # batch (send the complete desired list, not a delta) — an empty list is
+    # a valid, explicit "unassign every subject", distinct from omitting the
+    # field entirely (which leaves subjects untouched).
+    level_id: Optional[uuid.UUID] = None
+    subject_ids: Optional[List[uuid.UUID]] = None
+
+    @field_validator("boards")
+    @classmethod
+    def _boards_not_empty_when_provided(cls, v: Optional[List[BoardEnum]]) -> Optional[List[BoardEnum]]:
+        if v is not None and len(v) == 0:
+            raise ValueError("boards cannot be empty — a teacher must be qualified for at least one board")
+        seen: dict[BoardEnum, None] = {}
+        for board in v or []:
+            seen.setdefault(board, None)
+        return list(seen.keys()) if v is not None else v
 
 
 class UserOut(BaseModel):
@@ -73,6 +143,7 @@ class UserOut(BaseModel):
     email: str
     role: str
     status: str
+    must_change_password: bool
     phone_number: Optional[str] = None
     created_by: Optional[uuid.UUID] = None
     last_login_at: Optional[datetime] = None
@@ -93,6 +164,7 @@ class StudentProfileOut(BaseModel):
     nationality: Optional[str] = None
     cnic: Optional[str] = None
     registration_id: Optional[str] = None
+    board: BoardEnum
 
     class Config:
         from_attributes = True
@@ -105,6 +177,11 @@ class TeacherProfileOut(BaseModel):
     gender: Optional[str] = None
     cnic: Optional[str] = None
     teacher_code: Optional[str] = None
+    # Populated by the router from TeacherBoard rows — not a real column on
+    # teacher_profiles (see app/models/user.py: TeacherProfile.boards is a
+    # relationship, not a Column), so this can't just be from_attributes'd
+    # off the plain ORM object without the router mapping it in.
+    boards: List[BoardEnum] = []
 
     class Config:
         from_attributes = True
@@ -198,3 +275,12 @@ class MyProfileOut(BaseModel):
     teacher_profile: Optional[TeacherProfileOut] = None
     parent_profile: Optional[ParentProfileOut] = None
     class_name: Optional[str] = None
+
+
+class AdminResetPasswordRequest(BaseModel):
+    """POST /api/users/{user_id}/reset-password — Admin/Coordinator sets a
+    new (temporary) password for someone else. No current_password needed
+    here, unlike ChangePasswordRequest — the caller's own admin/coordinator
+    session is the trust anchor, not knowledge of the target's old password.
+    Always sets must_change_password=True on the target (see router)."""
+    new_password: str = Field(min_length=8)

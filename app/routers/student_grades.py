@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import require_roles, check_license
-from app.models import Grade, Mark, Assessment, Subject, User
+from app.models import Grade, Mark, Assessment, Subject, User, Level
 from app.schemas.student_grades import (
     GradeReportEntryOut, SubjectMarksReportOut, MarkEntryOut,
 )
@@ -20,10 +20,16 @@ router = APIRouter(prefix="/api/marks", tags=["student-marks"], dependencies=[De
 
 @router.get("/me/grades", response_model=List[GradeReportEntryOut])
 def my_grade_report(db: Session = Depends(get_db), current_user: User = Depends(require_roles("student"))):
-    """One row per subject: the student's auto-computed (or overridden) grade."""
+    """One row per subject: the student's auto-computed (or overridden) grade.
+
+    Note: whether the grade was coordinator-overridden is intentionally
+    NOT surfaced here (see GradeReportEntryOut) — students only ever see
+    the clean final percentage + letter grade, never override metadata.
+    """
     rows = (
-        db.query(Grade, Subject.name.label("subject_name"))
+        db.query(Grade, Subject.name.label("subject_name"), Level.code.label("level_code"))
         .join(Subject, Subject.id == Grade.subject_id)
+        .outerjoin(Level, Level.id == Subject.level_id)
         .filter(Grade.student_id == current_user.id, Grade.deleted_at.is_(None))
         .all()
     )
@@ -31,11 +37,11 @@ def my_grade_report(db: Session = Depends(get_db), current_user: User = Depends(
         GradeReportEntryOut(
             subject_id=grade.subject_id,
             subject_name=subject_name,
+            level_code=level_code,
             computed_percentage=float(grade.computed_percentage) if grade.computed_percentage is not None else None,
             letter_grade=grade.letter_grade,
-            is_overridden=grade.is_overridden,
         )
-        for grade, subject_name in rows
+        for grade, subject_name, level_code in rows
     ]
 
 
@@ -46,6 +52,8 @@ def my_marks_for_subject(subject_id: uuid.UUID, db: Session = Depends(get_db),
     subject = db.query(Subject).filter(Subject.id == subject_id, Subject.deleted_at.is_(None)).first()
     if not subject:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subject not found")
+
+    level = db.query(Level).filter(Level.id == subject.level_id).first() if subject.level_id else None
 
     rows = (
         db.query(Mark, Assessment.name.label("assessment_name"), Assessment.max_marks)
@@ -69,4 +77,9 @@ def my_marks_for_subject(subject_id: uuid.UUID, db: Session = Depends(get_db),
         )
         for mark, assessment_name, max_marks in rows
     ]
-    return SubjectMarksReportOut(subject_id=subject_id, subject_name=subject.name, assessments=assessments)
+    return SubjectMarksReportOut(
+        subject_id=subject_id,
+        subject_name=subject.name,
+        level_code=level.code if level else None,
+        assessments=assessments,
+    )

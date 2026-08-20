@@ -12,7 +12,7 @@ from app.core.notifications import notify
 from app.models import (
     ParentStudentLink, StudentProfile, User, Batch, AttendanceRecord, Grade,
     Mark, Assessment, Subject, Enrollment, TimetableSlot,
-    StudentLevelEnrollment, SubjectRequest,
+    StudentLevelEnrollment, SubjectRequest, BatchSubject,
 )
 from app.schemas.parent import (
     ParentChildOut, ParentChildOverviewOut, ParentSubjectTranscriptOut, ParentMarkEntryOut,
@@ -320,8 +320,24 @@ def child_available_subjects(student_id: uuid.UUID, db: Session = Depends(get_db
     }
     exclude_ids = already_enrolled_subject_ids | already_requested_subject_ids
 
+    # schema_update_13: STRICTLY hide any subject that hasn't been
+    # explicitly offered by Admin for the current batch — being in one of
+    # the child's active Levels is no longer sufficient on its own. Before
+    # this, every subject in the child's level(s) showed up here regardless
+    # of whether Admin had actually turned it on for this batch/session.
+    offered_subject_ids = {
+        row.subject_id for row in db.query(BatchSubject.subject_id).filter(
+            BatchSubject.batch_id == current_batch.id,
+            BatchSubject.is_active.is_(True),
+        ).all()
+    }
+    if not offered_subject_ids:
+        return ParentAvailableSubjectsOut(batch_id=current_batch.id, batch_name=current_batch.name, subjects=[])
+
     query = db.query(Subject).filter(
-        Subject.level_id.in_(active_level_ids), Subject.deleted_at.is_(None),
+        Subject.level_id.in_(active_level_ids),
+        Subject.id.in_(offered_subject_ids),
+        Subject.deleted_at.is_(None),
     )
     if exclude_ids:
         query = query.filter(Subject.id.notin_(exclude_ids))

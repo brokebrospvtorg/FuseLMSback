@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     FEE_PROOF_RETENTION_CRON_HOUR: int = 4  # runs daily at 04:00 server time
     FEE_PROOF_RETENTION_PLACEHOLDER: str = "DELETED_DUE_TO_RETENTION_POLICY"
 
+    # --- Batch expiry (Batch Generator utility, app/core/batch_utils.py) ---
+    # A batch is "over" once the NEXT standard batch's month arrives (see
+    # batch_utils.is_batch_over) — checked daily since that's cheap and
+    # months don't roll over predictably on any single day-of-month.
+    BATCH_EXPIRY_CRON_HOUR: int = 1  # runs daily at 01:00 server time
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

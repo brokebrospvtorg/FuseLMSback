@@ -4,6 +4,8 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from app.schemas.common import BoardEnum
+
 
 class TimetableSlotCreate(BaseModel):
     level_id: uuid.UUID
@@ -132,6 +134,9 @@ class AttendanceSummaryOut(BaseModel):
     not something the schema dictates."""
     subject_id: uuid.UUID
     subject_name: str
+    # DB level code (e.g. "AS-LEVEL") for the frontend's level badge — see
+    # app/core/grading.py::LEVEL_ABBREVIATIONS. None if unset/soft-deleted.
+    level_code: Optional[str] = None
     present_count: int
     absent_count: int
     late_count: int
@@ -156,6 +161,17 @@ class TimetableSlotDetailOut(BaseModel):
     period_number: int
     start_time: time
     end_time: time
+    # Over-Inclusive Cascading Dropdowns fix: which active BatchSubject
+    # board this slot's subject+batch is actually offered under, resolved
+    # server-side — same idea as TeacherSubjectAssignmentOut.board (see
+    # that field's docstring in schemas/academic.py). Populated (and the
+    # slot fanned out once per active board) only on Teacher-scoped reads
+    # (GET /timetable/slots for a Teacher, GET /timetable/my-teaching-schedule)
+    # where a board-accurate cascade actually matters; left None on the
+    # Admin/Coordinator Interactive Timetable Builder's unfiltered listing,
+    # which intentionally still needs to see every slot regardless of
+    # offering status in order to fix ones that drifted out of sync.
+    board: Optional[BoardEnum] = None
 
 
 class CoordinatorRosterEntry(BaseModel):
@@ -176,6 +192,24 @@ class CoordinatorStudentOverrideRequest(BaseModel):
     subject_id: uuid.UUID
     date: date
     records: list[StudentAttendanceMarkItem]
+
+
+class TeacherAttendanceLogEntry(BaseModel):
+    """One row per class (period+date) the teacher has already taken —
+    the Day-Wise UI's 'View Summary' history table. Aggregates the
+    student-level AttendanceRecord rows for that period+date into counts
+    so the table doesn't need to render one row per student."""
+    date: date
+    timetable_slot_id: uuid.UUID
+    period_number: int
+    subject_id: uuid.UUID
+    subject_name: str
+    level_code: Optional[str] = None
+    present_count: int
+    absent_count: int
+    late_count: int
+    excused_count: int
+    total_students: int
 
 
 class TimetableSlotUpdate(BaseModel):

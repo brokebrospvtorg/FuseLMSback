@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import require_roles
-from app.core.jobs import generate_fee_vouchers, cleanup_expired_tokens
+from app.core.jobs import generate_fee_vouchers, cleanup_expired_tokens, expire_ended_batches
 from app.models import SystemSettings, User
 from app.schemas.system import SystemSettingsOut, SystemSettingsUpdate
 
@@ -34,8 +34,8 @@ def update_settings(payload: SystemSettingsUpdate, db: Session = Depends(get_db)
 
 
 # ---------------------------------------------------------------------------
-# Manual triggers for the two scheduled jobs (app/core/jobs.py). Both run on
-# their own cron schedule already (see app/core/scheduler.py) — these exist
+# Manual triggers for the scheduled jobs (app/core/jobs.py). Each already
+# runs on its own cron schedule (see app/core/scheduler.py) — these exist
 # so an Admin can run them on demand instead of waiting for the schedule,
 # e.g. right after go-live or while testing.
 # ---------------------------------------------------------------------------
@@ -47,3 +47,11 @@ def trigger_fee_voucher_generation(current_user: User = Depends(require_roles("a
 @router.post("/jobs/cleanup-expired-tokens")
 def trigger_token_cleanup(current_user: User = Depends(require_roles("admin"))):
     return cleanup_expired_tokens()
+
+
+@router.post("/jobs/expire-ended-batches")
+def trigger_batch_expiry(current_user: User = Depends(require_roles("admin"))):
+    """Soft-deletes any batch whose next standard batch's month has
+    arrived, cascading to every table that references it (see
+    app/core/jobs.expire_ended_batches for the full list)."""
+    return expire_ended_batches()

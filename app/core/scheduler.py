@@ -4,7 +4,9 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import settings
-from app.core.jobs import generate_fee_vouchers, cleanup_expired_tokens, cleanup_old_fee_proofs
+from app.core.jobs import (
+    generate_fee_vouchers, cleanup_expired_tokens, cleanup_old_fee_proofs, expire_ended_batches,
+)
 
 logger = logging.getLogger("fuse_lms.scheduler")
 
@@ -40,10 +42,19 @@ def start_scheduler() -> None:
         misfire_grace_time=3600,
     )
 
+    scheduler.add_job(
+        expire_ended_batches,
+        trigger=CronTrigger(hour=settings.BATCH_EXPIRY_CRON_HOUR, minute=0),
+        id="expire_ended_batches",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
     scheduler.start()
     logger.info(
         "Scheduler started: cleanup_expired_tokens (daily), "
-        "generate_fee_vouchers (monthly), cleanup_old_fee_proofs (daily)"
+        "generate_fee_vouchers (monthly), cleanup_old_fee_proofs (daily), "
+        "expire_ended_batches (daily)"
     )
 
 

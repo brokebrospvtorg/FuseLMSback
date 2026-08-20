@@ -14,7 +14,12 @@ from decimal import Decimal
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.file_storage import delete_fee_proof_file
-from app.models import Batch, Enrollment, FeeProof, FeeVoucher, VerificationToken
+from app.core.batch_utils import is_batch_over
+from app.models import (
+    Batch, Enrollment, FeeProof, FeeVoucher, VerificationToken,
+    SubjectRequest, TeacherSubjectAssignment, TimetableSlot, AttendanceRecord,
+    Assessment, Mark, MarkEditRequest, Grade,
+)
 
 logger = logging.getLogger("fuse_lms.jobs")
 
@@ -170,6 +175,127 @@ def cleanup_old_fee_proofs() -> dict:
     except Exception:
         db.rollback()
         logger.exception("cleanup_old_fee_proofs failed")
+        raise
+    finally:
+        db.close()
+
+
+def expire_ended_batches() -> dict:
+    """
+    Batch Generator lifecycle rule (app/core/batch_utils.is_batch_over):
+    a batch is considered OVER once the NEXT standard batch's month
+    arrives — not merely once its own end_date passes (there's a real
+    ~4-month gap after Oct/Nov before the following May/June starts, and
+    the batch stays "current-ish" for reporting purposes until that next
+    batch's month actually begins).
+
+    For every non-deleted batch that has crossed that point, this soft-
+    deletes the batch AND every row across the system that belongs to
+    it — "remove batch, and also soft delete all information of batch"
+    per the spec:
+      - subject_requests, enrollments, teacher_subject_assignments,
+        timetable_slots, fee_vouchers, assessments, grades (direct
+        batch_id children)
+      - attendance_records (via timetable_slot_id), fee_proofs (via
+        voucher_id), marks + mark_edit_requests (via assessment_id / then
+        mark_id) — second-order children of the rows above
+
+    Everything is a soft delete (deleted_at set), never a hard DELETE —
+    consistent with every other deleted_at column in this schema. The
+    batch and its historical data remain in the database for audit/
+    reporting; they just drop out of every endpoint that already filters
+    on deleted_at IS NULL. is_current is also cleared on the batch itself
+    so an expired batch can never be mistaken for the live one.
+
+    Like the other jobs here, this runs on its own short-lived session,
+    is not user-triggered by default, and does not write to audit_logs.
+    """
+    db = SessionLocal()
+    expired: list[dict] = []
+    try:
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        candidates = db.query(Batch).filter(Batch.deleted_at.is_(None)).all()
+
+        for batch in candidates:
+            if not is_batch_over(batch.session, batch.year, as_of=today):
+                continue
+
+            # --- Second-order children first ---
+            slot_ids = [
+                row.id for row in db.query(TimetableSlot.id).filter(
+                    TimetableSlot.batch_id == batch.id, TimetableSlot.deleted_at.is_(None),
+                ).all()
+            ]
+            if slot_ids:
+                db.query(AttendanceRecord).filter(
+                    AttendanceRecord.timetable_slot_id.in_(slot_ids),
+                    AttendanceRecord.deleted_at.is_(None),
+                ).update({"deleted_at": now}, synchronize_session=False)
+
+            voucher_ids = [
+                row.id for row in db.query(FeeVoucher.id).filter(
+                    FeeVoucher.batch_id == batch.id, FeeVoucher.deleted_at.is_(None),
+                ).all()
+            ]
+            if voucher_ids:
+                db.query(FeeProof).filter(
+                    FeeProof.voucher_id.in_(voucher_ids), FeeProof.deleted_at.is_(None),
+                ).update({"deleted_at": now}, synchronize_session=False)
+
+            assessment_ids = [
+                row.id for row in db.query(Assessment.id).filter(
+                    Assessment.batch_id == batch.id, Assessment.deleted_at.is_(None),
+                ).all()
+            ]
+            if assessment_ids:
+                mark_ids = [
+                    row.id for row in db.query(Mark.id).filter(
+                        Mark.assessment_id.in_(assessment_ids), Mark.deleted_at.is_(None),
+                    ).all()
+                ]
+                db.query(Mark).filter(
+                    Mark.assessment_id.in_(assessment_ids), Mark.deleted_at.is_(None),
+                ).update({"deleted_at": now}, synchronize_session=False)
+                if mark_ids:
+                    db.query(MarkEditRequest).filter(
+                        MarkEditRequest.mark_id.in_(mark_ids), MarkEditRequest.deleted_at.is_(None),
+                    ).update({"deleted_at": now}, synchronize_session=False)
+
+            # --- Direct batch_id children ---
+            db.query(SubjectRequest).filter(
+                SubjectRequest.batch_id == batch.id, SubjectRequest.deleted_at.is_(None),
+            ).update({"deleted_at": now}, synchronize_session=False)
+            db.query(Enrollment).filter(
+                Enrollment.batch_id == batch.id, Enrollment.deleted_at.is_(None),
+            ).update({"deleted_at": now}, synchronize_session=False)
+            db.query(TeacherSubjectAssignment).filter(
+                TeacherSubjectAssignment.batch_id == batch.id, TeacherSubjectAssignment.deleted_at.is_(None),
+            ).update({"deleted_at": now}, synchronize_session=False)
+            db.query(TimetableSlot).filter(
+                TimetableSlot.batch_id == batch.id, TimetableSlot.deleted_at.is_(None),
+            ).update({"deleted_at": now}, synchronize_session=False)
+            db.query(FeeVoucher).filter(
+                FeeVoucher.batch_id == batch.id, FeeVoucher.deleted_at.is_(None),
+            ).update({"deleted_at": now}, synchronize_session=False)
+            db.query(Assessment).filter(
+                Assessment.batch_id == batch.id, Assessment.deleted_at.is_(None),
+            ).update({"deleted_at": now}, synchronize_session=False)
+            db.query(Grade).filter(
+                Grade.batch_id == batch.id, Grade.deleted_at.is_(None),
+            ).update({"deleted_at": now}, synchronize_session=False)
+
+            # --- The batch itself ---
+            batch.deleted_at = now
+            batch.is_current = False
+            expired.append({"id": str(batch.id), "name": batch.name})
+
+        db.commit()
+        logger.info(f"expire_ended_batches: soft-deleted {len(expired)} batch(es)")
+        return {"expired_count": len(expired), "expired_batches": expired}
+    except Exception:
+        db.rollback()
+        logger.exception("expire_ended_batches failed")
         raise
     finally:
         db.close()

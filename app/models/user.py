@@ -1,11 +1,11 @@
 import uuid
 
-from sqlalchemy import Column, Text, ForeignKey, TIMESTAMP, Date, text
+from sqlalchemy import Column, Text, ForeignKey, TIMESTAMP, Date, Boolean, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
-from app.models.enums import UserRole, UserStatus, TokenType, CorrectionStatus
+from app.models.enums import UserRole, UserStatus, TokenType, CorrectionStatus, Board
 
 
 class User(Base):
@@ -18,6 +18,7 @@ class User(Base):
     role = Column(UserRole, nullable=False)
     status = Column(UserStatus, nullable=False, server_default="pending")
     phone_number = Column(Text)
+    must_change_password = Column(Boolean, nullable=False, server_default="false")
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     last_login_at = Column(TIMESTAMP(timezone=True))
     deleted_at = Column(TIMESTAMP(timezone=True))
@@ -42,6 +43,10 @@ class StudentProfile(Base):
     nationality = Column(Text)
     cnic = Column(Text)
     registration_id = Column(Text)
+    # schema_update_11: required Board the student is registered under
+    # (British Council / Edexcel / LRN). NOT NULL — every Student form
+    # submission (create or edit) must supply it.
+    board = Column(Board, nullable=False)
 
     user = relationship("User", back_populates="student_profile")
 
@@ -57,6 +62,31 @@ class TeacherProfile(Base):
     teacher_code = Column(Text)
 
     user = relationship("User", back_populates="teacher_profile")
+    boards = relationship(
+        "TeacherBoard", back_populates="teacher_profile",
+        cascade="all, delete-orphan", passive_deletes=True,
+    )
+
+
+class TeacherBoard(Base):
+    """
+    schema_update_11: which exam board(s) a Teacher is qualified to teach.
+    A join table (teacher_id, board) rather than a Postgres array column —
+    keeps each assignment a normal, queryable/indexable row (e.g. "which
+    teachers are qualified for Edexcel") and gives every row its own
+    created_at, same convention as the rest of this schema's link tables
+    (parent_student_links, teacher_subject_assignments, ...).
+    """
+    __tablename__ = "teacher_boards"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    teacher_id = Column(
+        UUID(as_uuid=True), ForeignKey("teacher_profiles.user_id", ondelete="CASCADE"), nullable=False,
+    )
+    board = Column(Board, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+    teacher_profile = relationship("TeacherProfile", back_populates="boards")
 
 
 class ParentProfile(Base):

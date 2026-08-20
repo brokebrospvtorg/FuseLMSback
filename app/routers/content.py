@@ -10,11 +10,15 @@ from app.core.dependencies import get_current_user, require_roles, check_license
 from app.core.audit import log_action
 from app.core.notifications import notify
 from app.utils.youtube import parse_youtube_video_id
-from app.models import HelpingMaterial, Lecture, ClassroomEditRequest, YoutubeEditRequest, Enrollment, User, Subject
+from app.models import (
+    HelpingMaterial, Lecture, ClassroomEditRequest, YoutubeEditRequest, SubjectClassroomLink,
+    Enrollment, User, Subject,
+)
 from app.schemas.content import (
     HelpingMaterialCreate, HelpingMaterialOut, LectureCreate, LectureOut,
     SetClassroomUrlRequest, RequestClassroomEditRequest, ClassroomEditRequestOut, ClassroomRequestReview,
     SetYoutubeVideoRequest, RequestYoutubeEditRequest, YoutubeEditRequestOut, YoutubeRequestReview,
+    SetSubjectClassroomLinkRequest, UpdateSubjectClassroomLinkRequest, SubjectClassroomLinkOut,
 )
 
 router = APIRouter(prefix="/api/content", tags=["content"], dependencies=[Depends(check_license)])
@@ -132,7 +136,30 @@ def replace_material(material_id: uuid.UUID, db: Session = Depends(get_db),
 @router.post("/lectures", response_model=LectureOut, status_code=status.HTTP_201_CREATED)
 def upload_lecture(payload: LectureCreate, db: Session = Depends(get_db),
                     current_user: User = Depends(require_roles("teacher", "admin", "coordinator"))):
-    lecture = Lecture(**payload.model_dump(), uploaded_by=current_user.id)
+    """
+    LMS & Study Resources refactor: Title, Description, and YouTube Video
+    Link are all submitted together — the video is parsed and locked right
+    here, at creation, instead of the old two-step "create empty, then set
+    video separately" flow. Google Classroom is intentionally not part of
+    this call at all anymore (see the Subject-level classroom link section
+    below) — a bad/unrecognized YouTube link still 400s before any row is
+    written, same defend-at-the-boundary approach as before.
+    """
+    video_id = parse_youtube_video_id(payload.youtube_url)
+    if not video_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Could not recognize that as a YouTube link or video ID. "
+                   "Paste a full YouTube link (youtube.com/watch?v=..., youtu.be/..., "
+                   "/embed/..., /shorts/...) or an 11-character video ID.",
+        )
+    data = payload.model_dump(exclude={"youtube_url"})
+    lecture = Lecture(
+        **data,
+        uploaded_by=current_user.id,
+        youtube_video_id=video_id,
+        youtube_video_id_locked=True,
+    )
     db.add(lecture)
     db.commit()
     db.refresh(lecture)
@@ -285,6 +312,118 @@ def request_classroom_url_edit(lecture_id: uuid.UUID, payload: RequestClassroomE
     db.commit()
     db.refresh(edit_request)
     return edit_request
+
+
+# ---------------------------------------------------------------------------
+# Subject-level Google Classroom link (LMS & Study Resources refactor)
+# Replaces the per-lecture classroom_url flow above for the Student "LMS &
+# Study Resources" screen and the Teacher "Lectures & Notes" screen: one
+# link per Subject, set once, then directly editable — no lock/approval
+# queue for this one (that distinction stays specific to the legacy
+# per-lecture flow and to YouTube video edits below).
+# ---------------------------------------------------------------------------
+def _to_subject_classroom_link_out(db: Session, link: SubjectClassroomLink) -> SubjectClassroomLinkOut:
+    out = SubjectClassroomLinkOut.model_validate(link)
+    subject = db.query(Subject).filter(Subject.id == link.subject_id).first()
+    if subject:
+        out.subject_name = subject.name
+    return out
+
+
+@router.get("/subjects/{subject_id}/classroom-link", response_model=Optional[SubjectClassroomLinkOut])
+def get_subject_classroom_link(subject_id: uuid.UUID, db: Session = Depends(get_db),
+                                current_user: User = Depends(get_current_user)):
+    """Returns null (not 404) when no link has been set yet for the subject —
+    that's the normal "Add Google Classroom Link" state, not an error."""
+    if current_user.role == "student" and not _student_has_subject_access(db, current_user.id, subject_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enrolled in this subject")
+    link = db.query(SubjectClassroomLink).filter(SubjectClassroomLink.subject_id == subject_id).first()
+    if not link:
+        return None
+    return _to_subject_classroom_link_out(db, link)
+
+
+@router.get("/classroom-links/me", response_model=List[SubjectClassroomLinkOut])
+def list_my_classroom_links(db: Session = Depends(get_db),
+                             current_user: User = Depends(require_roles("student"))):
+    """Aggregate across every subject the student is (or was) enrolled in —
+    same access rule as list_my_materials/list_my_lectures — for the "LMS &
+    Study Resources" screen's Google Classroom card grid. Subjects with no
+    link set yet are simply omitted; the screen shows what's available."""
+    subject_ids = [
+        row[0] for row in db.query(Enrollment.subject_id).filter(
+            Enrollment.student_id == current_user.id, Enrollment.deleted_at.is_(None),
+        ).distinct().all()
+    ]
+    if not subject_ids:
+        return []
+
+    rows = (
+        db.query(SubjectClassroomLink, Subject.name.label("subject_name"))
+        .join(Subject, Subject.id == SubjectClassroomLink.subject_id)
+        .filter(SubjectClassroomLink.subject_id.in_(subject_ids))
+        .order_by(Subject.name.asc())
+        .all()
+    )
+    results = []
+    for link, subject_name in rows:
+        out = SubjectClassroomLinkOut.model_validate(link)
+        out.subject_name = subject_name
+        results.append(out)
+    return results
+
+
+@router.post("/subjects/{subject_id}/classroom-link", response_model=SubjectClassroomLinkOut,
+             status_code=status.HTTP_201_CREATED)
+def set_subject_classroom_link(subject_id: uuid.UUID, payload: SetSubjectClassroomLinkRequest,
+                                db: Session = Depends(get_db),
+                                current_user: User = Depends(require_roles("teacher", "admin", "coordinator"))):
+    """"Add Google Classroom Link" — initial set only. 409s if the subject
+    already has one; use the PUT below ("Edit Google Classroom Link") to
+    change it instead."""
+    subject = db.query(Subject).filter(Subject.id == subject_id).first()
+    if not subject:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subject not found")
+
+    existing = db.query(SubjectClassroomLink).filter(SubjectClassroomLink.subject_id == subject_id).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A Google Classroom link is already set for this subject. Use Edit Google Classroom Link instead.",
+        )
+
+    link = SubjectClassroomLink(
+        subject_id=subject_id, classroom_url=str(payload.classroom_url), set_by=current_user.id,
+    )
+    db.add(link)
+    db.flush()
+    log_action(db, current_user.id, "subject_classroom_link_set", "subject_classroom_links", link.id,
+               None, {"classroom_url": link.classroom_url})
+    db.commit()
+    db.refresh(link)
+    return _to_subject_classroom_link_out(db, link)
+
+
+@router.put("/subjects/{subject_id}/classroom-link", response_model=SubjectClassroomLinkOut)
+def update_subject_classroom_link(subject_id: uuid.UUID, payload: UpdateSubjectClassroomLinkRequest,
+                                   db: Session = Depends(get_db),
+                                   current_user: User = Depends(require_roles("teacher", "admin", "coordinator"))):
+    """"Edit Google Classroom Link" — direct update, no approval step."""
+    link = db.query(SubjectClassroomLink).filter(SubjectClassroomLink.subject_id == subject_id).first()
+    if not link:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No Google Classroom link set for this subject yet — add one first.",
+        )
+
+    old_url = link.classroom_url
+    link.classroom_url = str(payload.classroom_url)
+    link.updated_at = datetime.now(timezone.utc)
+    log_action(db, current_user.id, "subject_classroom_link_updated", "subject_classroom_links", link.id,
+               {"classroom_url": old_url}, {"classroom_url": link.classroom_url})
+    db.commit()
+    db.refresh(link)
+    return _to_subject_classroom_link_out(db, link)
 
 
 # ---------------------------------------------------------------------------

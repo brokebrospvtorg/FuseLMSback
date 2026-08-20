@@ -41,8 +41,34 @@ class Lecture(Base):
 
     # Lectures Sub-Sprint 1: Google Classroom link, set once by the Teacher,
     # then locked. Further changes must go through classroom_edit_requests.
+    # LEGACY as of schema_update_17 (LMS & Study Resources refactor): the
+    # Student/Teacher UI no longer reads or writes these two columns — the
+    # Google Classroom link is now a single per-Subject setting, see
+    # SubjectClassroomLink above. Left in place only so the existing
+    # Coordinator/Admin "Classroom Requests" review queue keeps working
+    # against historical data.
     classroom_url = Column(Text, nullable=True)
     classroom_url_locked = Column(Boolean, nullable=False, server_default="false")
+
+
+class SubjectClassroomLink(Base):
+    """
+    LMS & Study Resources refactor (schema_update_17): the Google Classroom
+    link is now a single per-Subject configuration instead of living on each
+    Lecture. A Teacher sets it once (POST) for a subject; after that, only a
+    direct edit (PUT) is available — unlike the legacy per-lecture
+    classroom_url, there is no lock-then-approval-queue step here, since the
+    spec only asks that the *initial* upload flow stop re-asking for it, not
+    that later edits be gated behind Coordinator review.
+    """
+    __tablename__ = "subject_classroom_links"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    subject_id = Column(UUID(as_uuid=True), ForeignKey("subjects.id"), nullable=False, unique=True)
+    classroom_url = Column(Text, nullable=False)
+    set_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
 
 
 class ClassroomEditRequest(Base):

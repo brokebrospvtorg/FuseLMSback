@@ -15,7 +15,7 @@ from app.models import User, VerificationToken, CorrectionRequest
 from app.schemas.auth import (
     LoginRequest, UserOut, TokenVerifyRequest, TokenVerifyResponse,
     ActivationSubmitRequest, CorrectionOnActivationRequest,
-    PasswordResetRequestSchema, PasswordResetSubmitRequest,
+    PasswordResetRequestSchema, PasswordResetSubmitRequest, ChangePasswordRequest,
 )
 from app.utils.email import send_email
 
@@ -216,3 +216,32 @@ def submit_password_reset(request: Request, payload: PasswordResetSubmitRequest,
     vt.used_at = datetime.now(timezone.utc)
     db.commit()
     return {"detail": "Password updated. You can now log in."}
+
+
+@router.post("/change-password")
+@limiter.limit("5/minute")
+def change_password(
+    request: Request, payload: ChangePasswordRequest,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user),
+):
+    """
+    Self-service change for a LOGGED-IN user who knows their current
+    password. Distinct from both existing password paths:
+      - submit-activation / submit-password-reset: prove control of the
+        email inbox via a token, no current password needed.
+      - this endpoint: prove you ARE the account by supplying the current
+        password, no email/token round-trip needed.
+    """
+    if not current_user.password_hash or not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Current password is incorrect")
+
+    if payload.new_password == payload.current_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from your current password",
+        )
+
+    current_user.password_hash = hash_password(payload.new_password)
+    current_user.must_change_password = False
+    db.commit()
+    return {"detail": "Password changed successfully."}

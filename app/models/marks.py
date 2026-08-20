@@ -28,6 +28,16 @@ class Mark(Base):
     marks_obtained = Column(Numeric, nullable=False)
     uploaded_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     uploaded_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    # Mark Override refactor (schema_update_18): Coordinator/Admin correction
+    # now happens at the individual-mark level via PATCH
+    # /api/academics/marks/{mark_id}/mark-override (see routers/marks.py),
+    # not on the subject-level Grade anymore. is_overridden/overridden_by
+    # are the audit trail for that action — set together, only by that
+    # endpoint. Every override triggers _recompute_grades_for_subject_batch
+    # so the student's pooled percentage/letter grade always reflects the
+    # corrected value; nothing on Grade itself is ever "frozen" by this.
+    is_overridden = Column(Boolean, nullable=False, server_default="false")
+    overridden_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     deleted_at = Column(TIMESTAMP(timezone=True))
 
 
@@ -65,6 +75,18 @@ class GradingScheme(Base):
 
 
 class Grade(Base):
+    """
+    Mark Override refactor (schema_update_18): Grade is now PURELY a
+    computed rollup of a subject+batch's published assessment marks — see
+    routers/marks.py::_recompute_grades_for_subject_batch. There is no
+    longer a way to override a Grade directly (the old PATCH
+    /grades/{id}/override endpoint and its is_overridden/overridden_by/
+    override_reason columns are removed). Coordinators/Admins now correct
+    an individual Mark instead (Mark.is_overridden/overridden_by above),
+    and every such correction automatically recomputes this row — so
+    computed_percentage/letter_grade are always in sync with current marks,
+    never manually frozen.
+    """
     __tablename__ = "grades"
 
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
@@ -73,9 +95,6 @@ class Grade(Base):
     batch_id = Column(UUID(as_uuid=True), ForeignKey("batches.id"), nullable=False)
     computed_percentage = Column(Numeric)
     letter_grade = Column(Text)
-    is_overridden = Column(Boolean, nullable=False, server_default="false")
-    overridden_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
-    override_reason = Column(Text)
     last_computed_at = Column(TIMESTAMP(timezone=True))
     deleted_at = Column(TIMESTAMP(timezone=True))
 

@@ -10,13 +10,14 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_roles, check_license
 from app.core.audit import log_action
 from app.core.notifications import notify
+from app.core.grading import calculate_percentage, calculate_grade
 from app.models import (
     Assessment, Mark, GradingScheme, Grade, User, Enrollment, StudentProfile, AuditLog,
     MarkEditRequest, Subject,
 )
 from app.schemas.marks import (
     AssessmentCreate, AssessmentUpdate, AssessmentOut, MarkUpsert, MarkOut,
-    GradingSchemeCreate, GradingSchemeOut, GradeOverrideRequest, GradeOut, RosterEntryOut, AuditLogOut,
+    GradingSchemeCreate, GradingSchemeOut, MarkOverrideRequest, GradeOut, RosterEntryOut, AuditLogOut,
     MarkEditRequestCreate, MarkEditRequestReview, MarkEditRequestOut, MarkEditRequestWithContextOut,
 )
 router = APIRouter(prefix="/api/academics", tags=["marks-grades"], dependencies=[Depends(check_license)])
@@ -176,6 +177,11 @@ def upsert_marks(assessment_id: uuid.UUID, payload: List[MarkUpsert], db: Sessio
 
     results = []
     for item in payload:
+        if item.marks_obtained < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="marks_obtained cannot be negative",
+            )
         if item.marks_obtained > assessment.max_marks:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -399,7 +405,9 @@ def list_grading_schemes(level_id: uuid.UUID, db: Session = Depends(get_db),
 
 
 # ---------------------------------------------------------------------------
-# Grades — auto-computed; Coordinator can override (audited + notifies teacher)
+# Grades — read-only, purely auto-computed from published assessment marks.
+# See PATCH /marks/{mark_id}/mark-override below for how a Coordinator/Admin
+# correction actually reaches these rows (there is no direct grade edit).
 # ---------------------------------------------------------------------------
 def _recompute_grades_for_subject_batch(db: Session, subject_id: uuid.UUID, batch_id: uuid.UUID, actor_id: uuid.UUID):
     """Recomputes every enrolled student's grade for this subject+batch, pooled across
@@ -424,35 +432,65 @@ def _recompute_grades_for_subject_batch(db: Session, subject_id: uuid.UUID, batc
     for student_id in student_ids:
         obtained_total = Decimal("0")
         max_total = Decimal("0")
+        has_marks = False
         for a in assessments:
             mark = db.query(Mark).filter(
                 Mark.assessment_id == a.id, Mark.student_id == student_id, Mark.deleted_at.is_(None)
             ).first()
-            if mark and a.max_marks:
+            # a.max_marks > 0 guard: a zero/blank max_marks assessment can't
+            # contribute a meaningful percentage, so it's excluded from the
+            # pool entirely rather than being allowed to divide by zero.
+            if mark and a.max_marks and a.max_marks > 0:
                 obtained_total += mark.marks_obtained
                 max_total += a.max_marks
+                has_marks = True
 
-        pooled_percentage = (obtained_total / max_total * Decimal("100")) if max_total else Decimal("0")
+        if not has_marks:
+            # Nothing graded for this student yet — leave percentage/grade
+            # null (no auto-assigned "U") rather than pretending a 0%
+            # result exists before any mark has actually been entered.
+            pooled_percentage = None
+            letter_grade = None
+        else:
+            # (obtained / max) * 100, cleanly zero-guarded — same formula
+            # everywhere marks become a percentage (see core/grading.py).
+            pooled_percentage = calculate_percentage(obtained_total, max_total)
 
-        letter_grade = None
-        if subj:
-            scheme_row = db.query(GradingScheme).filter(
-                GradingScheme.level_id == subj.level_id,
-                GradingScheme.min_percentage <= pooled_percentage,
-                GradingScheme.max_percentage >= pooled_percentage,
-                GradingScheme.deleted_at.is_(None),
-            ).first()
-            if scheme_row:
-                letter_grade = scheme_row.letter_grade
+            # Auto-grading: an admin-configured GradingScheme for this
+            # level always wins when its band covers the percentage: it
+            # lets a level customize the school-wide scale.  But a level
+            # with NO scheme configured — the out-of-the-box state for
+            # every level until an Admin sets one up — must still get an
+            # automatic letter grade, so we always fall back to the
+            # standard A*/A/B/C/D/U thresholds instead of leaving
+            # letter_grade null. This is what makes grading actually
+            # automatic rather than depending on manual scheme setup.
+            letter_grade = None
+            if subj:
+                scheme_row = db.query(GradingScheme).filter(
+                    GradingScheme.level_id == subj.level_id,
+                    GradingScheme.min_percentage <= pooled_percentage,
+                    GradingScheme.max_percentage >= pooled_percentage,
+                    GradingScheme.deleted_at.is_(None),
+                ).first()
+                if scheme_row:
+                    letter_grade = scheme_row.letter_grade
+            if letter_grade is None:
+                letter_grade = calculate_grade(pooled_percentage)
 
         grade = db.query(Grade).filter(
             Grade.student_id == student_id, Grade.subject_id == subject_id, Grade.batch_id == batch_id
         ).first()
         if grade:
-            if not grade.is_overridden:
-                grade.computed_percentage = pooled_percentage
-                grade.letter_grade = letter_grade
-                grade.last_computed_at = datetime.now(timezone.utc)
+            # Mark Override refactor (schema_update_18): Grade is purely
+            # computed now — always overwrite. There's no more "frozen by
+            # override" state to protect; a Coordinator/Admin correction
+            # lives on the individual Mark (Mark.is_overridden) and this
+            # function is exactly how that correction reaches the pooled
+            # percentage/letter grade.
+            grade.computed_percentage = pooled_percentage
+            grade.letter_grade = letter_grade
+            grade.last_computed_at = datetime.now(timezone.utc)
         else:
             db.add(Grade(
                 student_id=student_id, subject_id=subject_id, batch_id=batch_id,
@@ -478,76 +516,106 @@ def list_grades(student_id: Optional[uuid.UUID] = None, subject_id: Optional[uui
     return query.all()
 
 
-@router.patch("/grades/{grade_id}/override", response_model=GradeOut)
-def override_grade(grade_id: uuid.UUID, payload: GradeOverrideRequest, db: Session = Depends(get_db),
-                    current_user: User = Depends(require_roles("coordinator", "admin"))):
-    grade = db.query(Grade).filter(Grade.id == grade_id, Grade.deleted_at.is_(None)).first()
-    if not grade:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Grade not found")
+@router.patch("/marks/{mark_id}/mark-override", response_model=MarkOut)
+def mark_override(mark_id: uuid.UUID, payload: MarkOverrideRequest, db: Session = Depends(get_db),
+                   current_user: User = Depends(require_roles("coordinator", "admin"))):
+    """
+    Mark Override refactor (schema_update_18): Coordinator/Admin direct
+    correction of ONE student's score on ONE assessment — replaces the
+    removed PATCH /grades/{grade_id}/override. A subject-level letter
+    grade is never set directly; changing the mark here always triggers
+    _recompute_grades_for_subject_batch so the student's pooled
+    percentage/grade is derived fresh from every published assessment,
+    same as any other mark change.
+    """
+    mark = db.query(Mark).filter(Mark.id == mark_id, Mark.deleted_at.is_(None)).first()
+    if not mark:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mark not found")
 
-    old_value = {"letter_grade": grade.letter_grade, "is_overridden": grade.is_overridden}
-    grade.letter_grade = payload.letter_grade
-    grade.is_overridden = True
-    grade.overridden_by = current_user.id
-    grade.override_reason = payload.override_reason
+    assessment = db.query(Assessment).filter(Assessment.id == mark.assessment_id).first()
+    if assessment and payload.marks_obtained > assessment.max_marks:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"marks_obtained ({payload.marks_obtained}) cannot exceed max_marks ({assessment.max_marks})",
+        )
+    if payload.marks_obtained < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="marks_obtained cannot be negative")
 
-    log_action(db, current_user.id, "grade_overridden", "grades", grade.id, old_value,
-               {"letter_grade": payload.letter_grade, "reason": payload.override_reason})
+    old_value = {"marks_obtained": str(mark.marks_obtained), "is_overridden": mark.is_overridden}
+    mark.marks_obtained = payload.marks_obtained
+    mark.is_overridden = True
+    mark.overridden_by = current_user.id
 
-    # Notify both the original teacher and the student whose grade changed —
-    # doc requires an in-app notification for each; email is a courtesy copy
-    # via the (stub) send_email(), fired for both through the shared helper.
-    original_assessment = db.query(Assessment).filter(
-        Assessment.subject_id == grade.subject_id, Assessment.batch_id == grade.batch_id,
-    ).first()
-    if original_assessment:
-        teacher = db.query(User).filter(User.id == original_assessment.created_by).first()
-        if teacher:
-            notify(
-                db, teacher.id, "grade_overridden",
-                f"A grade you submitted was overridden by a Coordinator: {payload.override_reason}",
-                related_entity_type="grades", related_entity_id=grade.id,
-                email_to=teacher.email, email_subject="Grade overridden",
-            )
+    log_action(db, current_user.id, "mark_overridden", "marks", mark.id, old_value,
+               {"marks_obtained": str(payload.marks_obtained), "reason": payload.override_reason})
 
-    student = db.query(User).filter(User.id == grade.student_id).first()
+    # Notify both the original teacher and the student whose mark changed —
+    # same "both parties informed" requirement the old grade-override
+    # notification had; email is a courtesy copy via the (stub) send_email().
+    teacher = db.query(User).filter(User.id == mark.uploaded_by).first()
+    if teacher:
+        notify(
+            db, teacher.id, "mark_overridden",
+            f"A mark you submitted was overridden by a Coordinator: {payload.override_reason}",
+            related_entity_type="marks", related_entity_id=mark.id,
+            email_to=teacher.email, email_subject="Mark overridden",
+        )
+
+    student = db.query(User).filter(User.id == mark.student_id).first()
     if student:
         notify(
-            db, student.id, "grade_overridden",
-            f"Your grade was updated by a Coordinator to {payload.letter_grade}.",
-            related_entity_type="grades", related_entity_id=grade.id,
-            email_to=student.email, email_subject="Your grade was updated",
+            db, student.id, "mark_overridden",
+            f"One of your marks was updated by a Coordinator to {payload.marks_obtained}.",
+            related_entity_type="marks", related_entity_id=mark.id,
+            email_to=student.email, email_subject="Your mark was updated",
         )
 
     db.commit()
-    db.refresh(grade)
-    return grade
+    db.refresh(mark)
+
+    if assessment and assessment.status == "published":
+        _recompute_grades_for_subject_batch(db, assessment.subject_id, assessment.batch_id, current_user.id)
+
+    return mark
 
 
-@router.get("/grades/audit-history", response_model=List[AuditLogOut])
-def grade_override_audit_history(
+@router.get("/marks/audit-history", response_model=List[AuditLogOut])
+def mark_override_audit_history(
     subject_id: uuid.UUID, batch_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("coordinator", "admin")),
+    current_user: User = Depends(require_roles("teacher", "coordinator", "admin")),
 ):
     """
-    Sub-Sprint 6.3: the "historical table of past overrides" for the
-    Coordinator's Grade Override panel.
+    Mark Override refactor (schema_update_18): renamed from
+    GET /grades/audit-history — the "historical table of past overrides"
+    for the Coordinator's panel now tracks Mark corrections (entity_type
+    "marks"), not Grade corrections, since Grade can no longer be
+    overridden directly. Same scoping rationale as before: limited to
+    exactly the subject+batch on screen, not the Admin-only global
+    /api/audit-logs feed.
 
-    Deliberately NOT just opening GET /api/audit-logs (audit.py) to
-    Coordinator — that endpoint is Admin-only by design and returns every
-    audit_logs row system-wide (role changes, fee approvals, everything).
-    This is scoped to exactly what the panel needs: grade-override history
-    for the subject+batch currently on screen, nothing else a Coordinator
-    isn't supposed to see.
+    Teacher Marksheet visibility: Teacher is allowed to call this too (was
+    Coordinator/Admin-only), so their marksheet can show the pre-override
+    value next to a mark a Coordinator corrected — otherwise the original
+    figure they entered is lost the moment it's overwritten. Scoped down
+    to marks_query for their own uploads (Mark.uploaded_by == self) so a
+    Teacher can't see another Teacher's override history for the same
+    subject/batch; Coordinator/Admin keep the unfiltered subject+batch view.
     """
-    grade_ids = [row.id for row in db.query(Grade.id).filter(
-        Grade.subject_id == subject_id, Grade.batch_id == batch_id,
-    ).all()]
-    if not grade_ids:
+    marks_query = (
+        db.query(Mark.id)
+        .join(Assessment, Assessment.id == Mark.assessment_id)
+        .filter(Assessment.subject_id == subject_id, Assessment.batch_id == batch_id)
+    )
+    if current_user.role == "teacher":
+        marks_query = marks_query.filter(Mark.uploaded_by == current_user.id)
+
+    mark_ids = [row.id for row in marks_query.all()]
+    if not mark_ids:
         return []
 
     return db.query(AuditLog).filter(
-        AuditLog.entity_type == "grades",
-        AuditLog.entity_id.in_(grade_ids),
+        AuditLog.entity_type == "marks",
+        AuditLog.entity_id.in_(mark_ids),
     ).order_by(AuditLog.created_at.desc()).limit(200).all()
+
