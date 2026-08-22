@@ -1,14 +1,18 @@
 import uuid
-from datetime import date as date_type
+from datetime import date as date_type, time
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import case, func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_roles, check_license
-from app.models import AttendanceRecord, TimetableSlot, User, Subject, Enrollment, Level
+from app.core.offering_utils import active_boards_map
+from app.core.audit import log_action
+from app.core.notifications import notify
+from app.models import AttendanceRecord, TimetableSlot, User, Subject, Enrollment, Level, Batch
 from app.schemas.attendance import (
     StudentAttendanceMarkRequest, TeacherAttendanceOverrideRequest, AttendanceRecordOut,
     AttendanceRecordDetailOut, AttendanceSummaryOut, PeriodRecordOut,
@@ -16,16 +20,168 @@ from app.schemas.attendance import (
     TeacherRosterEntry, TeacherDailyStatusEntry,
     CoordinatorRosterEntry, CoordinatorStudentOverrideRequest,
     TeacherAttendanceLogEntry,
+    AdminTeacherAttendanceEntry, AdminTeacherAttendanceMarkRequest,
 )
+from app.schemas.common import BoardEnum
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"], dependencies=[Depends(check_license)])
+
+
+class CoordinatorDayWiseEntry(BaseModel):
+    """
+    One row per period, for the Day-Wise Attendance View that replaces the
+    old full-calendar Coordinator Attendance UI. Returned by the cascade
+    endpoint below (Batch -> Board -> Level -> Subject -> Period/Date) so
+    the Coordinator can pick a period and jump into
+    GET/POST /api/attendance/coordinator/roster + /override-students for
+    that exact timetable_slot_id + date.
+    """
+    timetable_slot_id: uuid.UUID
+    start_time: time
+    end_time: time
+    batch_id: uuid.UUID
+    batch_name: str
+    board: str
+    level_id: uuid.UUID
+    level_code: Optional[str] = None
+    subject_id: uuid.UUID
+    subject_name: str
+    teacher_id: uuid.UUID
+    teacher_name: str
+    present_count: int
+    absent_count: int
+    late_count: int
+    excused_count: int
+    total_students: int
+    is_submitted: bool
+
+
+@router.get("/coordinator/day-wise", response_model=List[CoordinatorDayWiseEntry])
+def coordinator_day_wise_attendance(
+    date: date_type,
+    batch_id: uuid.UUID,
+    board: Optional[BoardEnum] = None,
+    level_id: Optional[uuid.UUID] = None,
+    subject_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "coordinator")),
+):
+    """
+    Day-Wise Attendance View (no calendar). `date` + `batch_id` are always
+    required — nothing renders before a Batch and a day are picked, same
+    as the frontend's cascade. `board`, `level_id`, `subject_id`
+    progressively narrow that same day's periods, in that exact order:
+    Batch -> Board -> Level -> Subject -> Period/Date.
+
+    board isn't a TimetableSlot column (it's a batch_subjects concept —
+    see BatchSubject's own docstring), so it's resolved and filtered via
+    the same active-offering lookup the Teacher-side timetable cascade
+    already uses (active_boards_map), not a direct column filter.
+
+    Each row is one period on that day for the matching filters, with the
+    student attendance already recorded against it for `date` (zeros +
+    is_submitted=False when the teacher hasn't marked it yet) — the
+    Coordinator drills into a specific row via the existing
+    /coordinator/roster and /coordinator/override-students endpoints.
+    """
+    day_name = date.strftime("%A").lower()
+    teacher = aliased(User)
+    query = (
+        db.query(
+            TimetableSlot, Subject.name.label("subject_name"), Level.code.label("level_code"),
+            teacher.full_name.label("teacher_name"), Batch.name.label("batch_name"),
+        )
+        .join(Subject, Subject.id == TimetableSlot.subject_id)
+        .join(teacher, teacher.id == TimetableSlot.teacher_id)
+        .join(Batch, Batch.id == TimetableSlot.batch_id)
+        .outerjoin(Level, Level.id == TimetableSlot.level_id)
+        .filter(
+            TimetableSlot.batch_id == batch_id,
+            TimetableSlot.day_of_week == day_name,
+            TimetableSlot.deleted_at.is_(None),
+        )
+    )
+    if level_id:
+        query = query.filter(TimetableSlot.level_id == level_id)
+    if subject_id:
+        query = query.filter(TimetableSlot.subject_id == subject_id)
+    # Strictly chronological — no period_number anywhere in this codebase.
+    rows = query.order_by(TimetableSlot.start_time).all()
+    if not rows:
+        return []
+
+    boards_by_pair = active_boards_map(db, ((slot.batch_id, slot.subject_id) for slot, *_ in rows))
+
+    slot_ids = [slot.id for slot, *_ in rows]
+    count_rows = (
+        db.query(
+            AttendanceRecord.timetable_slot_id,
+            func.sum(case((AttendanceRecord.status == "present", 1), else_=0)).label("present_count"),
+            func.sum(case((AttendanceRecord.status == "absent", 1), else_=0)).label("absent_count"),
+            func.sum(case((AttendanceRecord.status == "late", 1), else_=0)).label("late_count"),
+            func.sum(case((AttendanceRecord.status == "excused", 1), else_=0)).label("excused_count"),
+            func.count(AttendanceRecord.id).label("total"),
+        )
+        # Explicit join (not just a bare filter reference) — TimetableSlot
+        # has to actually be in the FROM clause for the teacher-exclusion
+        # filter below to be a real join condition instead of an implicit
+        # cross join against every slot.
+        .join(TimetableSlot, TimetableSlot.id == AttendanceRecord.timetable_slot_id)
+        .filter(
+            AttendanceRecord.timetable_slot_id.in_(slot_ids),
+            AttendanceRecord.user_id != TimetableSlot.teacher_id,  # student rows only, not the teacher's auto-mark
+            AttendanceRecord.date == date,
+            AttendanceRecord.deleted_at.is_(None),
+        )
+        .group_by(AttendanceRecord.timetable_slot_id)
+        .all()
+    )
+    counts_by_slot = {c.timetable_slot_id: c for c in count_rows}
+
+    result: List[CoordinatorDayWiseEntry] = []
+    for slot, subject_name, level_code, teacher_name, batch_name in rows:
+        boards = boards_by_pair.get((slot.batch_id, slot.subject_id), [])
+        if not boards:
+            continue  # no active offering left for this slot's batch+subject
+        if board and board.value not in boards:
+            continue
+        c = counts_by_slot.get(slot.id)
+        result.append(CoordinatorDayWiseEntry(
+            timetable_slot_id=slot.id,
+            start_time=slot.start_time,
+            end_time=slot.end_time,
+            batch_id=slot.batch_id,
+            batch_name=batch_name,
+            board=board.value if board else sorted(boards)[0],
+            level_id=slot.level_id,
+            level_code=level_code,
+            subject_id=slot.subject_id,
+            subject_name=subject_name,
+            teacher_id=slot.teacher_id,
+            teacher_name=teacher_name,
+            present_count=c.present_count if c else 0,
+            absent_count=c.absent_count if c else 0,
+            late_count=c.late_count if c else 0,
+            excused_count=c.excused_count if c else 0,
+            total_students=c.total if c else 0,
+            is_submitted=c is not None,
+        ))
+    return result
 
 
 @router.post("/mark-students", response_model=List[AttendanceRecordOut], status_code=status.HTTP_201_CREATED)
 def mark_student_attendance(
     payload: StudentAttendanceMarkRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("teacher")),
+    # S3.3 backend fix: also admits a Coordinator with a dual Teacher
+    # assignment (see RoleSwitchService/teacherPortalGuard on the
+    # frontend). No separate TeacherSubjectAssignment lookup is added
+    # here — the ownership check immediately below (slot.teacher_id !=
+    # current_user.id) already is the assignment check: TimetableSlot
+    # .teacher_id is a direct FK to this specific user, so a Coordinator
+    # can only ever pass this gate for a slot that is literally theirs
+    # to teach, exactly the same as a real Teacher account.
+    current_user: User = Depends(require_roles("teacher", "coordinator")),
 ):
     """
     Teacher marks per-period attendance for their own students.
@@ -40,9 +196,9 @@ def mark_student_attendance(
 
     # Strict current-date enforcement: a Teacher may only create or edit
     # attendance (this endpoint upserts, so it covers both) for today.
-    # Past dates are read-only for the Teacher (view via /my-history-log or
-    # /my-period-records); corrections to past dates go through the
-    # Coordinator's override endpoints. Future dates aren't markable at all.
+    # Past dates are read-only for the Teacher; corrections to past dates
+    # go through the Coordinator's override endpoints. Future dates aren't
+    # markable at all.
     if payload.date != date_type.today():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -101,14 +257,21 @@ def get_my_period_records(
     timetable_slot_id: uuid.UUID,
     date: date_type,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("teacher")),
+    # S3.3 backend fix: also admits a Coordinator with a dual Teacher
+    # assignment (see RoleSwitchService/teacherPortalGuard on the
+    # frontend). No separate TeacherSubjectAssignment lookup is added
+    # here — the ownership check immediately below (slot.teacher_id !=
+    # current_user.id) already is the assignment check: TimetableSlot
+    # .teacher_id is a direct FK to this specific user, so a Coordinator
+    # can only ever pass this gate for a slot that is literally theirs
+    # to teach, exactly the same as a real Teacher account.
+    current_user: User = Depends(require_roles("teacher", "coordinator")),
 ):
     """
-    Sub-Sprint 3.2 — lets the Teacher's Mark Attendance screen check
-    whether a period+date was already submitted (so it can render a
-    locked, read-only view instead of the editable grid), and lets a
-    past date be inspected read-only. Excludes the teacher's own
-    auto-marked row — this is student records only.
+    Lets the Teacher's Mark Attendance screen check whether a period+date
+    was already submitted (so it can render a locked, read-only view
+    instead of the editable grid), and lets a past date be inspected
+    read-only. Excludes the teacher's own auto-marked row.
     """
     slot = db.query(TimetableSlot).filter(
         TimetableSlot.id == timetable_slot_id, TimetableSlot.deleted_at.is_(None)
@@ -135,14 +298,20 @@ def get_my_attendance_history_log(
     date_from: Optional[date_type] = None,
     date_to: Optional[date_type] = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("teacher")),
+    # S3.3 backend fix: also admits a Coordinator with a dual Teacher
+    # assignment (see RoleSwitchService/teacherPortalGuard on the
+    # frontend). No separate TeacherSubjectAssignment lookup is added
+    # here — the ownership check immediately below (slot.teacher_id !=
+    # current_user.id) already is the assignment check: TimetableSlot
+    # .teacher_id is a direct FK to this specific user, so a Coordinator
+    # can only ever pass this gate for a slot that is literally theirs
+    # to teach, exactly the same as a real Teacher account.
+    current_user: User = Depends(require_roles("teacher", "coordinator")),
 ):
     """
     Day-Wise UI's "View Summary" — a read-only historical log of classes
-    this teacher has already taken (today or earlier only; marking is
-    locked to today, so there is nothing to summarize for future dates).
-    One row per period+date actually taught, with the student attendance
-    breakdown for that class, filterable by subject/level/date range.
+    this teacher has already taken (today or earlier only). One row per
+    period+date actually taught, ordered strictly by start_time.
     """
     today = date_type.today()
     effective_date_to = min(date_to, today) if date_to else today
@@ -151,7 +320,7 @@ def get_my_attendance_history_log(
         db.query(
             AttendanceRecord.date,
             AttendanceRecord.timetable_slot_id,
-            TimetableSlot.period_number,
+            TimetableSlot.start_time,
             AttendanceRecord.subject_id,
             Subject.name.label("subject_name"),
             Level.code.label("level_code"),
@@ -180,10 +349,10 @@ def get_my_attendance_history_log(
 
     rows = (
         query.group_by(
-            AttendanceRecord.date, AttendanceRecord.timetable_slot_id, TimetableSlot.period_number,
+            AttendanceRecord.date, AttendanceRecord.timetable_slot_id, TimetableSlot.start_time,
             AttendanceRecord.subject_id, Subject.name, Level.code,
         )
-        .order_by(AttendanceRecord.date.desc(), TimetableSlot.period_number)
+        .order_by(AttendanceRecord.date.desc(), TimetableSlot.start_time)
         .all()
     )
 
@@ -191,7 +360,7 @@ def get_my_attendance_history_log(
         TeacherAttendanceLogEntry(
             date=r.date,
             timetable_slot_id=r.timetable_slot_id,
-            period_number=r.period_number,
+            start_time=r.start_time,
             subject_id=r.subject_id,
             subject_name=r.subject_name,
             level_code=r.level_code,
@@ -222,7 +391,7 @@ def teacher_periods_without_records(
     )
     if batch_id:
         query = query.filter(TimetableSlot.batch_id == batch_id)
-    slots = query.all()
+    slots = query.order_by(TimetableSlot.start_time).all()
 
     gaps = []
     for slot in slots:
@@ -234,7 +403,6 @@ def teacher_periods_without_records(
                 "timetable_slot_id": str(slot.id),
                 "teacher_id": str(slot.teacher_id),
                 "subject_id": str(slot.subject_id),
-                "period_number": slot.period_number,
                 "start_time": str(slot.start_time),
                 "end_time": str(slot.end_time),
             })
@@ -249,15 +417,13 @@ def coordinator_student_roster(
     current_user: User = Depends(require_roles("admin", "coordinator")),
 ):
     """
-    Sub-Sprint 3 (Coordinator Portal): the Teacher's own roster fetch
-    (`/my-period-records`) is locked to `slot.teacher_id == current_user.id`
-    — which is exactly right for a Teacher, but means there was previously
-    NO way for a Coordinator to pull up a class roster at all, for either a
-    slot the teacher skipped entirely or one they already submitted. This
-    is the roster-only half of "edit capability for previous dates' student
-    attendance, bypassing the teacher lock" — every enrolled student for
-    the slot's subject+batch, with whatever attendance status already
-    exists for this date (None if nothing recorded yet).
+    Coordinator Portal: the Teacher's own roster fetch (`/my-period-records`)
+    is locked to `slot.teacher_id == current_user.id` — this is the
+    Coordinator equivalent, bypassing the teacher lock, for either a slot
+    the teacher skipped entirely or one they already submitted. Every
+    enrolled student for the slot's subject+batch, with whatever attendance
+    status already exists for this date (None if nothing recorded yet).
+    Reached from a row in GET /coordinator/day-wise.
     """
     slot = db.query(TimetableSlot).filter(
         TimetableSlot.id == timetable_slot_id, TimetableSlot.deleted_at.is_(None)
@@ -299,15 +465,10 @@ def coordinator_override_student_attendance(
     current_user: User = Depends(require_roles("admin", "coordinator")),
 ):
     """
-    The write half of the same gap: Teacher's `/mark-students` is
-    role-locked to Teacher AND, once saved, the Teacher's own frontend
-    treats that period as read-only going forward (no lock flag on the DB
-    row itself — the lock is enforced by which endpoint can write to it).
-    This endpoint is that bypass, scoped to Admin/Coordinator only, for any
-    date past or present. Deliberately does NOT touch the teacher's own
-    auto-marked attendance row for this slot — that's edited separately via
-    POST /api/attendance/teacher-override, so a Coordinator correcting a
-    student's mistaken entry doesn't accidentally reset the teacher's mark.
+    The write half of the roster bypass, scoped to Admin/Coordinator only,
+    for any date past or present. Deliberately does NOT touch the
+    teacher's own auto-marked attendance row for this slot — that's edited
+    separately via POST /api/attendance/teacher-override.
     """
     slot = db.query(TimetableSlot).filter(
         TimetableSlot.id == payload.timetable_slot_id, TimetableSlot.deleted_at.is_(None)
@@ -377,6 +538,204 @@ def coordinator_mark_or_override_teacher(
     return record
 
 
+@router.get("/admin/teacher-attendance", response_model=List[AdminTeacherAttendanceEntry])
+def admin_teacher_attendance_cascade(
+    date: date_type,
+    batch_id: uuid.UUID,
+    board: Optional[BoardEnum] = None,
+    level_id: Optional[uuid.UUID] = None,
+    subject_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "coordinator")),
+):
+    """
+    Admin Teacher Attendance — View & Edit (full parity with the
+    Coordinator's Day-Wise view, see GET /coordinator/day-wise, whose
+    cascade/board-resolution rules this mirrors exactly). Cascading
+    Selection: `batch_id` + `date` are always required — nothing renders
+    before a Batch and a day are picked; `board`, `level_id`, `subject_id`
+    progressively narrow that same day's periods in the enforced order
+    Batch -> Board -> Level -> Subject.
+
+    One row per period on `date` matching the filters, with the assigned
+    teacher's OWN attendance status for that period+date (None if never
+    marked at all — the Admin's screen renders that as an empty row ready
+    to be marked). The write side is POST /admin/teacher-attendance below.
+    """
+    day_name = date.strftime("%A").lower()
+    teacher = aliased(User)
+    query = (
+        db.query(
+            TimetableSlot, Subject.name.label("subject_name"), Level.code.label("level_code"),
+            teacher.full_name.label("teacher_name"), Batch.name.label("batch_name"),
+        )
+        .join(Subject, Subject.id == TimetableSlot.subject_id)
+        .join(teacher, teacher.id == TimetableSlot.teacher_id)
+        .join(Batch, Batch.id == TimetableSlot.batch_id)
+        .outerjoin(Level, Level.id == TimetableSlot.level_id)
+        .filter(
+            TimetableSlot.batch_id == batch_id,
+            TimetableSlot.day_of_week == day_name,
+            TimetableSlot.deleted_at.is_(None),
+        )
+    )
+    if level_id:
+        query = query.filter(TimetableSlot.level_id == level_id)
+    if subject_id:
+        query = query.filter(TimetableSlot.subject_id == subject_id)
+    rows = query.order_by(TimetableSlot.start_time).all()
+    if not rows:
+        return []
+
+    boards_by_pair = active_boards_map(db, ((slot.batch_id, slot.subject_id) for slot, *_ in rows))
+
+    slot_ids = [slot.id for slot, *_ in rows]
+    teacher_id_by_slot = {slot.id: slot.teacher_id for slot, *_ in rows}
+    # Only the TEACHER's own row per slot+date — never a student's — kept
+    # by matching AttendanceRecord.user_id against that slot's assigned
+    # teacher_id, same isolation the /coordinator/day-wise student counts
+    # use in reverse (there it excludes the teacher; here it's the only
+    # row wanted).
+    candidate_records = db.query(AttendanceRecord).filter(
+        AttendanceRecord.timetable_slot_id.in_(slot_ids),
+        AttendanceRecord.date == date,
+        AttendanceRecord.deleted_at.is_(None),
+    ).all()
+    records_by_slot = {
+        r.timetable_slot_id: r
+        for r in candidate_records
+        if r.user_id == teacher_id_by_slot.get(r.timetable_slot_id)
+    }
+
+    result: List[AdminTeacherAttendanceEntry] = []
+    for slot, subject_name, level_code, teacher_name, batch_name in rows:
+        boards = boards_by_pair.get((slot.batch_id, slot.subject_id), [])
+        if not boards:
+            continue  # no active offering left for this slot's batch+subject
+        if board and board.value not in boards:
+            continue
+        record = records_by_slot.get(slot.id)
+        result.append(AdminTeacherAttendanceEntry(
+            timetable_slot_id=slot.id,
+            date=date,
+            start_time=slot.start_time,
+            end_time=slot.end_time,
+            batch_id=slot.batch_id,
+            batch_name=batch_name,
+            board=board.value if board else sorted(boards)[0],
+            level_id=slot.level_id,
+            level_code=level_code,
+            subject_id=slot.subject_id,
+            subject_name=subject_name,
+            teacher_id=slot.teacher_id,
+            teacher_name=teacher_name,
+            attendance_record_id=record.id if record else None,
+            status=record.status if record else None,
+            source=record.source if record else None,
+            marked_by=record.marked_by if record else None,
+            marked_at=record.marked_at if record else None,
+        ))
+    return result
+
+
+@router.post("/admin/teacher-attendance", response_model=AttendanceRecordOut)
+def mark_or_override_admin_teacher_attendance(
+    payload: AdminTeacherAttendanceMarkRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "coordinator")),
+):
+    """
+    Admin Teacher Attendance — Mark & Edit (the write half of the cascade
+    above). Marks, edits, or overrides ONE teacher's attendance for ONE
+    timetable_slot_id + date. Works for any date, past or present —
+    unlike the Teacher's own /mark-students, there's no "today only" lock
+    here, matching the existing /coordinator/override-students and
+    /teacher-override endpoints' "Admin/Coordinator can always correct
+    history" behavior.
+
+    Audit/Reason Logging: when this call changes an EXISTING attendance
+    record (i.e. it's an edit/override of a status the teacher, a
+    Coordinator, or a previous Admin action already set), `reason` is
+    MANDATORY and is written to the audit_logs trail via log_action
+    (entity_type='attendance_records', viewable at
+    GET /api/audit-logs?entity_type=attendance_records&entity_id=...),
+    exactly the same pattern PATCH /academics/marks/{id}/mark-override
+    uses for override_reason. First-time marking (no existing record yet
+    for this slot+date) does not require a reason, since there is nothing
+    being corrected — mirrors POST /teacher-override, which has never
+    required one for a first-time mark either.
+    """
+    slot = db.query(TimetableSlot).filter(
+        TimetableSlot.id == payload.timetable_slot_id, TimetableSlot.deleted_at.is_(None)
+    ).first()
+    if not slot:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Timetable slot not found")
+    if slot.teacher_id != payload.teacher_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="teacher_user_id does not match the teacher assigned to this timetable slot.",
+        )
+
+    valid_statuses = {"present", "absent", "late", "excused"}
+    if payload.status not in valid_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid status '{payload.status}'"
+        )
+
+    record = db.query(AttendanceRecord).filter(
+        AttendanceRecord.user_id == payload.teacher_user_id,
+        AttendanceRecord.timetable_slot_id == payload.timetable_slot_id,
+        AttendanceRecord.date == payload.date,
+    ).first()
+
+    if record:
+        # Editing/overriding an existing status — reason is mandatory.
+        if not payload.reason or not payload.reason.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A reason is required when editing or overriding an existing attendance record.",
+            )
+        old_value = {"status": record.status, "source": record.source}
+        record.status = payload.status
+        record.marked_by = current_user.id
+        record.source = "manual"
+        action = "teacher_attendance_overridden"
+    else:
+        old_value = None
+        record = AttendanceRecord(
+            user_id=payload.teacher_user_id,
+            subject_id=payload.subject_id,
+            timetable_slot_id=payload.timetable_slot_id,
+            date=payload.date,
+            status=payload.status,
+            marked_by=current_user.id,
+            source="manual",
+        )
+        db.add(record)
+        action = "teacher_attendance_marked"
+
+    db.flush()  # populate record.id (server_default) before logging/notifying it
+    log_action(
+        db, current_user.id, action, "attendance_records", record.id, old_value,
+        {"status": payload.status, "reason": payload.reason},
+    )
+
+    if action == "teacher_attendance_overridden":
+        teacher = db.query(User).filter(User.id == payload.teacher_user_id).first()
+        if teacher:
+            reason_suffix = f": {payload.reason}" if payload.reason else ""
+            notify(
+                db, teacher.id, "teacher_attendance_overridden",
+                f"Your attendance for {payload.date.isoformat()} was changed to "
+                f"'{payload.status}' by an Admin{reason_suffix}.",
+                related_entity_type="attendance_records", related_entity_id=record.id,
+            )
+
+    db.commit()
+    db.refresh(record)
+    return record
+
+
 @router.get("/teachers/roster", response_model=List[TeacherRosterEntry])
 def list_active_teachers(
     db: Session = Depends(get_db),
@@ -398,8 +757,8 @@ def get_teacher_daily_log(
     """
     One row per active teacher for the given date: how many periods they
     have that day (from timetable_slots), and their current status if set.
-    status is None when there are no periods that day (nothing to mark), or
-    when their periods disagree (e.g. one was individually overridden via
+    status is None when there are no periods that day, or when their
+    periods disagree (e.g. one was individually overridden via
     /teacher-override) — the UI should show that as unset/needs-review
     rather than silently picking one.
     """
@@ -523,8 +882,7 @@ def my_attendance_summary(db: Session = Depends(get_db), current_user: User = De
     result = []
     for r in rows:
         # "late" counts as attended for the percentage — a judgment call,
-        # not something the schema dictates. Change here if the academy
-        # wants late marked separately.
+        # not something the schema dictates.
         attended = r.present_count + r.late_count
         pct = round((attended / r.total_periods) * 100, 1) if r.total_periods else 0.0
         result.append(AttendanceSummaryOut(

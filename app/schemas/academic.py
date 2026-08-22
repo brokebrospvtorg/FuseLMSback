@@ -194,6 +194,35 @@ class SubjectCreate(BaseModel):
         return deduped
 
 
+class SubjectUpdate(BaseModel):
+    """PUT /api/academic/subjects/{id} — Admin Subjects module. Deliberately
+    narrower than SubjectCreate: only name/code are editable here (matches
+    the task's "Edit Subject Name/Code" scope). Board and Level mapping are
+    catalog-structural decisions made at creation time and aren't exposed
+    on this screen — changing them would silently reshape which batches/
+    offerings/enrollments this subject applies to, which belongs in a
+    separate, more deliberate flow if it's ever needed."""
+    name: str = Field(..., min_length=1, max_length=200)
+    code: str = Field(..., min_length=1, max_length=50)
+
+    @field_validator("name", "code")
+    @classmethod
+    def _strip_and_require_nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
+
+
+class SubjectStatusUpdate(BaseModel):
+    """PATCH /api/academic/subjects/{id}/status — Activate/Deactivate.
+    Separate from delete: deactivating hides the subject from every
+    "offer this subject" / enrollment / teacher-assignment picker
+    (list_subjects filters on is_active) without touching its history,
+    and is reversible. Delete is the one-way, dependency-checked action."""
+    is_active: bool
+
+
 class StudentLevelEnrollmentCreate(BaseModel):
     student_id: uuid.UUID
     level_id: uuid.UUID
@@ -386,7 +415,6 @@ class TimetableEntryOut(BaseModel):
     subject_name: str
     teacher_name: str
     day_of_week: str
-    period_number: int
     start_time: time
     end_time: time
 

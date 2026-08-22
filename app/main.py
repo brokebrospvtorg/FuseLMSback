@@ -9,6 +9,7 @@ from app.core.scheduler import start_scheduler, stop_scheduler
 from app.routers import (
     auth, users, academic, timetable, attendance, marks, fees, content,
     complaints, notifications, audit, system, student_grades, parent, batches,
+    subjects, password_requests,
 )
 
 app = FastAPI(
@@ -56,14 +57,14 @@ app.include_router(audit.router)
 app.include_router(system.router)
 app.include_router(parent.router)
 app.include_router(batches.router)
-# NOTE (schema_update_11): app/routers/subjects.py ("Subject & Class
-# Management" — free-form, batch-scoped subject creation with a required
-# subject code) is intentionally NOT mounted anymore. It has been replaced
-# by the pre-declared Cambridge subject catalog (app/seeds/seed_subjects.py,
-# GET /api/academic/subjects) plus the Batch Summary endpoint below
-# (GET /api/v1/batches/{batch_id}/summary). The file/table are left on disk
-# only so any historical rows aren't destroyed — no route in this app
-# reaches them anymore.
+# app/routers/subjects.py: repurposed as the Admin Subjects module (edit
+# name/code, activate/deactivate, dependency-checked delete). It no longer
+# holds the old schema_update_11 "Subject & Class Management" router (see
+# that file's own docstring) — GET/POST /api/academic/subjects (list +
+# create the catalog) remain in academic.router above; this one adds the
+# admin-only mutations on /api/academic/subjects/{id} and .../{id}/status.
+app.include_router(subjects.router)
+app.include_router(password_requests.router)
 
 
 @app.get("/api/health")

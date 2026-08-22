@@ -2,13 +2,58 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import Response
+from fastapi import HTTPException, Response, status
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 
 from app.core.config import settings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+# ---------------------------------------------------------------------------
+# Admin Role Isolation Guard
+# ---------------------------------------------------------------------------
+# Accounts with role 'admin' (or 'superadmin' — not yet a live UserRole enum
+# value, guarded pre-emptively so this doesn't quietly regress the day it's
+# added) are strictly root-level super-users/system management identities.
+# They must never be assignable as a Teacher anywhere a teacher_id is
+# accepted — TeacherSubjectAssignment (app/routers/academic.py) and
+# TimetableSlot (app/routers/timetable.py) both accept a teacher_id and are
+# the two places this has to be enforced. This lives in security.py (rather
+# than duplicated inline in each router) so every call site shares one
+# definition of "who counts as an admin" and one error message.
+ADMIN_ROLES = frozenset({"admin", "superadmin"})
+
+
+def is_admin_role(role: str) -> bool:
+    """True for any root-level super-user role — never a valid Teacher assignee."""
+    return role in ADMIN_ROLES
+
+
+def guard_teacher_assignee_role(role: str, *, context: str = "a Teacher") -> None:
+    """
+    Root Role Isolation Guard: raises 400 if `role` (the role of the user
+    being assigned) is an admin-tier role. Call this at every write path
+    that accepts a teacher_id/teacher_user_id — before the row is created
+    or updated, never after — so an Admin/Superadmin account can never end
+    up attached to a Batch, Subject, or Timetable Slot as the teacher.
+
+    This is a defense-in-depth check: some call sites additionally query
+    for teacher_id scoped to role == 'teacher' (or a Coordinator with a
+    legacy TeacherProfile) and would already 404 an admin's id via that
+    filter alone. This guard exists so the rejection is explicit,
+    intentional, and produces a clear 400 rather than relying solely on an
+    incidental side effect of an unrelated eligibility filter.
+    """
+    if is_admin_role(role):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Accounts with the 'admin' or 'superadmin' role cannot be assigned as {context}. "
+                "Admins are strictly super-users/root management, not teaching staff."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -11,11 +11,15 @@ from app.core.security import (
     set_auth_cookie, clear_auth_cookie, generate_verification_token,
 )
 from app.core.config import settings
-from app.models import User, VerificationToken, CorrectionRequest
+from app.models import (
+    User, VerificationToken, CorrectionRequest, StudentProfile, TeacherProfile,
+    PasswordResetRequest,
+)
 from app.schemas.auth import (
     LoginRequest, UserOut, TokenVerifyRequest, TokenVerifyResponse,
     ActivationSubmitRequest, CorrectionOnActivationRequest,
     PasswordResetRequestSchema, PasswordResetSubmitRequest, ChangePasswordRequest,
+    AdminPasswordResetRequestCreate,
 )
 from app.utils.email import send_email
 
@@ -187,6 +191,75 @@ def request_password_reset(request: Request, payload: PasswordResetRequestSchema
         send_email(user.email, "Reset your FUSE LMS password", f"Reset link token: {token_str}")
 
     return {"detail": "If that email exists, a reset link has been sent."}
+
+
+@router.post("/request-password-reset-approval", status_code=status.HTTP_201_CREATED)
+@limiter.limit("5/minute")
+def request_password_reset_approval(
+    request: Request, payload: AdminPasswordResetRequestCreate, db: Session = Depends(get_db),
+):
+    """
+    Logged-out 'Request Password Reset from Admin' button — a second,
+    manual-review path alongside the email-token flow above
+    (POST /request-password-reset). For when the account can't reliably
+    receive email, the identifier accepted here is free text: email,
+    Student roll number, or Teacher employee code, matched in that order.
+
+    Same user-enumeration stance as the email-token endpoint: whether or
+    not the identifier matches an account, this always returns the same
+    generic success response — an Admin reviewing the (possibly
+    unresolvable) queue entry is the only place that distinction surfaces.
+    """
+    identifier = payload.identifier.strip()
+
+    user = (
+        db.query(User)
+        .filter(User.email == identifier, User.deleted_at.is_(None))
+        .first()
+    )
+    if not user:
+        student = (
+            db.query(StudentProfile)
+            .join(User, User.id == StudentProfile.user_id)
+            .filter(StudentProfile.roll_number == identifier, User.deleted_at.is_(None))
+            .first()
+        )
+        if student:
+            user = db.query(User).filter(User.id == student.user_id).first()
+    if not user:
+        teacher = (
+            db.query(TeacherProfile)
+            .join(User, User.id == TeacherProfile.user_id)
+            .filter(TeacherProfile.teacher_code == identifier, User.deleted_at.is_(None))
+            .first()
+        )
+        if teacher:
+            user = db.query(User).filter(User.id == teacher.user_id).first()
+
+    # A request row needs a user_id, so an identifier that matches no
+    # account genuinely can't be recorded — there's nothing for an Admin
+    # to review. The response text is identical either way, though, so a
+    # caller probing identifiers learns nothing from it about whether a
+    # match was found.
+    if user and user.status == "active":
+        existing_pending = (
+            db.query(PasswordResetRequest)
+            .filter(
+                PasswordResetRequest.user_id == user.id,
+                PasswordResetRequest.status == "pending",
+                PasswordResetRequest.deleted_at.is_(None),
+            )
+            .first()
+        )
+        if not existing_pending:
+            reset_request = PasswordResetRequest(
+                user_id=user.id,
+                identifier_submitted=identifier,
+            )
+            db.add(reset_request)
+            db.commit()
+
+    return {"detail": "Reset request sent to Admin successfully."}
 
 
 @router.post("/submit-password-reset")

@@ -13,7 +13,6 @@ class TimetableSlotCreate(BaseModel):
     teacher_id: uuid.UUID
     batch_id: uuid.UUID
     day_of_week: str
-    period_number: int
     start_time: time
     end_time: time
 
@@ -25,7 +24,6 @@ class TimetableSlotOut(BaseModel):
     teacher_id: uuid.UUID
     batch_id: uuid.UUID
     day_of_week: str
-    period_number: int
     start_time: time
     end_time: time
 
@@ -158,7 +156,6 @@ class TimetableSlotDetailOut(BaseModel):
     batch_id: uuid.UUID
     batch_name: str
     day_of_week: str
-    period_number: int
     start_time: time
     end_time: time
     # Over-Inclusive Cascading Dropdowns fix: which active BatchSubject
@@ -201,7 +198,7 @@ class TeacherAttendanceLogEntry(BaseModel):
     so the table doesn't need to render one row per student."""
     date: date
     timetable_slot_id: uuid.UUID
-    period_number: int
+    start_time: time
     subject_id: uuid.UUID
     subject_name: str
     level_code: Optional[str] = None
@@ -210,6 +207,59 @@ class TeacherAttendanceLogEntry(BaseModel):
     late_count: int
     excused_count: int
     total_students: int
+
+
+class AdminTeacherAttendanceEntry(BaseModel):
+    """
+    One row per period on the selected date, matching the Admin Teacher
+    Attendance screen's Batch -> Board -> Level -> Subject cascade —
+    mirrors CoordinatorDayWiseEntry (routers/attendance.py) but scoped to
+    the assigned teacher's own attendance status for that period, not the
+    student roster counts.
+
+    `status`/`source`/`marked_by`/`marked_at`/`attendance_record_id` are
+    all None when nothing has been recorded yet for this teacher+period+
+    date — the Admin's screen renders that as an empty/unmarked row it can
+    mark for the first time. When they're populated, editing this row is
+    an override of an existing record, not a first-time mark — see
+    AdminTeacherAttendanceMarkRequest.reason.
+    """
+    timetable_slot_id: uuid.UUID
+    date: date
+    start_time: time
+    end_time: time
+    batch_id: uuid.UUID
+    batch_name: str
+    board: str
+    level_id: uuid.UUID
+    level_code: Optional[str] = None
+    subject_id: uuid.UUID
+    subject_name: str
+    teacher_id: uuid.UUID
+    teacher_name: str
+    attendance_record_id: Optional[uuid.UUID] = None
+    status: Optional[str] = None
+    source: Optional[str] = None
+    marked_by: Optional[uuid.UUID] = None
+    marked_at: Optional[datetime] = None
+
+
+class AdminTeacherAttendanceMarkRequest(BaseModel):
+    """
+    Admin Teacher Attendance — mark, edit, or override one teacher's
+    attendance for one timetable_slot_id + date. Reason logging: `reason`
+    is validated in the router (not here, since the rule depends on
+    whether a record already exists for this slot+date — see
+    mark_or_override_teacher_attendance's docstring) — required when this
+    call is editing/overriding an existing status, optional when it's the
+    first time this period+date has been marked at all.
+    """
+    timetable_slot_id: uuid.UUID
+    subject_id: uuid.UUID
+    teacher_user_id: uuid.UUID
+    date: date
+    status: str  # present | absent | late | excused
+    reason: Optional[str] = None
 
 
 class TimetableSlotUpdate(BaseModel):
@@ -223,6 +273,5 @@ class TimetableSlotUpdate(BaseModel):
     teacher_id: Optional[uuid.UUID] = None
     batch_id: Optional[uuid.UUID] = None
     day_of_week: Optional[str] = None
-    period_number: Optional[int] = None
     start_time: Optional[time] = None
     end_time: Optional[time] = None

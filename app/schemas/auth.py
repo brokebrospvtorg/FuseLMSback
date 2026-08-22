@@ -57,6 +57,42 @@ class PasswordResetSubmitRequest(BaseModel):
     new_password: str = Field(min_length=8)
 
 
+class AdminPasswordResetRequestCreate(BaseModel):
+    """POST /api/auth/request-password-reset-approval — the logged-out
+    'Request Password Reset from Admin' button (login screen). Deliberately
+    a free-text identifier rather than EmailStr like PasswordResetRequestSchema
+    above: this account may not have email access (that's the whole reason
+    for this path instead of the token-email flow), so a Student/Teacher can
+    submit their roll number / employee code instead."""
+    identifier: str = Field(min_length=1, max_length=255)
+
+
+class PasswordResetRequestOut(BaseModel):
+    """Admin Operations > Password Requests queue row."""
+    id: uuid.UUID
+    user_id: uuid.UUID
+    user_name: Optional[str] = None
+    role: Optional[str] = None
+    roll_or_employee_id: Optional[str] = None
+    identifier_submitted: str
+    status: str
+    reviewed_by: Optional[uuid.UUID] = None
+    review_note: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PasswordResetRequestReview(BaseModel):
+    """PATCH .../review. 'approved' resets the password to the fixed
+    onboarding value and forces a change on next login; 'rejected' just
+    closes the request out with no password change."""
+    status: str  # approved | rejected
+    review_note: Optional[str] = None
+
+
 class ChangePasswordRequest(BaseModel):
     """Self-service change, POST /api/auth/change-password. Requires knowing
     the CURRENT password — this is what distinguishes it from the admin

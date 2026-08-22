@@ -318,8 +318,16 @@ def create_mark_edit_request(mark_id: uuid.UUID, payload: MarkEditRequestCreate,
 
 
 @router.get("/marks/edit-requests/mine", response_model=List[MarkEditRequestWithContextOut])
-def list_my_mark_edit_requests(db: Session = Depends(get_db),
-                                current_user: User = Depends(require_roles("teacher"))):
+def list_my_mark_edit_requests(
+    db: Session = Depends(get_db),
+    # S3.3 backend fix: also admits a Coordinator with a dual Teacher
+    # assignment (see RoleSwitchService/teacherPortalGuard on the
+    # frontend). No separate assignment lookup needed — the query below
+    # filters directly on MarkEditRequest.requested_by == current_user.id,
+    # so a Coordinator only ever sees requests they themselves submitted
+    # while acting as a Teacher, exactly the same as a real Teacher account.
+    current_user: User = Depends(require_roles("teacher", "coordinator")),
+):
     rows = _mark_edit_context_query(db).filter(
         MarkEditRequest.requested_by == current_user.id
     ).order_by(MarkEditRequest.created_at.desc()).all()

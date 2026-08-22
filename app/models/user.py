@@ -123,6 +123,31 @@ class VerificationToken(Base):
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
 
 
+class PasswordResetRequest(Base):
+    """
+    Admin-approval password reset flow (distinct from the existing
+    email-token self-service flow backed by VerificationToken above).
+    A logged-out user who doesn't have email access (or whose email isn't
+    getting through) submits whatever identifier they have — email, roll
+    number, or teacher/employee code — and an Admin reviews it manually
+    from the Operations > Password Requests screen instead of a token
+    round-trip. identifier_submitted is kept verbatim (not just user_id)
+    so the Admin queue can show exactly what the requester typed, useful
+    context if the lookup is ambiguous or the account can't be found.
+    """
+    __tablename__ = "password_reset_requests"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    identifier_submitted = Column(Text, nullable=False)
+    status = Column(Text, nullable=False, server_default="pending")  # pending | approved | rejected
+    reviewed_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    review_note = Column(Text)
+    reviewed_at = Column(TIMESTAMP(timezone=True))
+    deleted_at = Column(TIMESTAMP(timezone=True))
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+
 class CorrectionRequest(Base):
     __tablename__ = "correction_requests"
 

@@ -3,7 +3,7 @@ from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -13,7 +13,7 @@ from app.core.dependencies import get_current_user, require_roles, check_license
 from app.core.audit import log_action
 from app.core.file_storage import save_fee_proof_file, resolve_fee_proof_path
 from app.core.notifications import notify
-from app.models import FeeVoucher, FeeProof, User, ParentStudentLink, FeeStructure, Subject
+from app.models import FeeVoucher, FeeProof, User, ParentStudentLink, FeeStructure, Subject, Batch, Enrollment
 from app.schemas.fees import (
     FeeVoucherCreate, FeeVoucherOut, FeeProofReview, FeeProofOut,
     FeeStructureCreate, FeeStructureOut, FeeStructureAmountUpdate,
@@ -40,6 +40,12 @@ def _status_text_for(latest_proof: Optional[FeeProof]) -> str:
     return "rejected"
 
 
+def _voucher_number(voucher: FeeVoucher) -> str:
+    """Display-only invoice/voucher code — see FeeVoucherOut.voucher_number
+    for why this isn't a stored column. Format: INV-<year>-<8 hex chars>."""
+    return f"INV-{voucher.generated_at.year}-{voucher.id.hex[:8].upper()}"
+
+
 def _voucher_out(db: Session, voucher: FeeVoucher, student_name: str) -> FeeVoucherOut:
     latest_proof = _latest_proof_for(db, voucher.id)
     return FeeVoucherOut(
@@ -47,6 +53,7 @@ def _voucher_out(db: Session, voucher: FeeVoucher, student_name: str) -> FeeVouc
         student_full_name=student_name,
         status=_status_text_for(latest_proof),
         latest_proof_id=latest_proof.id if latest_proof else None,
+        voucher_number=_voucher_number(voucher),
     )
 
 
@@ -117,6 +124,191 @@ def list_vouchers(student_id: Optional[uuid.UUID] = None,
         for u in db.query(User).filter(User.id.in_(student_ids or [uuid.uuid4()])).all()
     }
     return [_voucher_out(db, v, names_by_id.get(v.student_id, "Unknown")) for v in vouchers]
+
+
+@router.post("/students/{student_id}/generate-bill", response_model=FeeVoucherOut, status_code=status.HTTP_201_CREATED)
+def generate_fee_bill(student_id: uuid.UUID, db: Session = Depends(get_db),
+                       current_user: User = Depends(require_roles("admin", "coordinator"))):
+    """
+    On-demand "Generate Fee Bill" action (Admin/Coordinator Fee Structures
+    view) — distinct from the scheduled generate_fee_vouchers() job in
+    core/jobs.py, which stamps every student with the same flat
+    settings.FEE_VOUCHER_DEFAULT_AMOUNT. This endpoint instead prices the
+    bill from each of the student's active enrollments' fee_structures row
+    (a per-student override if one is set, else the subject-wide default),
+    which is the whole point of the Fee Structures feature — falling back
+    to the flat default here would silently bypass it.
+
+    Same "one voucher per student per batch" rule as the scheduled job:
+    if a non-deleted voucher already exists for this student in the
+    current batch, this returns 409 rather than creating a second one.
+    """
+    student = db.query(User).filter(User.id == student_id, User.role == "student").first()
+    if not student:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+
+    current_batch = db.query(Batch).filter(Batch.is_current.is_(True), Batch.deleted_at.is_(None)).first()
+    if not current_batch:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No current batch is set — mark a batch as current before generating fee bills.",
+        )
+
+    existing = db.query(FeeVoucher).filter(
+        FeeVoucher.student_id == student_id,
+        FeeVoucher.batch_id == current_batch.id,
+        FeeVoucher.deleted_at.is_(None),
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"{student.full_name} already has a fee bill for {current_batch.name} ({_voucher_number(existing)}).",
+        )
+
+    enrollments = db.query(Enrollment).filter(
+        Enrollment.student_id == student_id,
+        Enrollment.batch_id == current_batch.id,
+        Enrollment.status == "active",
+        Enrollment.deleted_at.is_(None),
+    ).all()
+    if not enrollments:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{student.full_name} has no active subject enrollment in {current_batch.name} — nothing to bill.",
+        )
+
+    total = Decimal("0")
+    missing_subject_names: list[str] = []
+    for enrollment in enrollments:
+        fs = (
+            db.query(FeeStructure).filter(
+                FeeStructure.subject_id == enrollment.subject_id,
+                FeeStructure.student_id == student_id,
+                FeeStructure.deleted_at.is_(None),
+            ).first()
+            or db.query(FeeStructure).filter(
+                FeeStructure.subject_id == enrollment.subject_id,
+                FeeStructure.student_id.is_(None),
+                FeeStructure.deleted_at.is_(None),
+            ).first()
+        )
+        if fs is None:
+            subject = db.query(Subject).filter(Subject.id == enrollment.subject_id).first()
+            missing_subject_names.append(subject.name if subject else str(enrollment.subject_id))
+            continue
+        total += fs.amount
+
+    if missing_subject_names:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "No fee structure is set for: " + ", ".join(missing_subject_names)
+                + ". Set a fee for these subjects (Fee Structures) before generating this bill."
+            ),
+        )
+
+    due_date = (datetime.now(timezone.utc) + timedelta(days=settings.FEE_VOUCHER_DUE_DAYS)).date()
+    voucher = FeeVoucher(student_id=student_id, batch_id=current_batch.id, amount=total, due_date=due_date)
+    db.add(voucher)
+    db.commit()
+    db.refresh(voucher)
+
+    log_action(
+        db, current_user.id, "fee_bill_generated", "fee_vouchers", voucher.id, None,
+        {
+            "batch_id": str(current_batch.id),
+            "amount": str(total),
+            "subject_ids": [str(e.subject_id) for e in enrollments],
+        },
+    )
+    notify(
+        db, student.id, "fee_bill_generated",
+        f"A new fee bill ({_voucher_number(voucher)}) of {total} has been generated. Due {due_date.isoformat()}.",
+        related_entity_type="fee_vouchers", related_entity_id=voucher.id,
+        email_to=student.email, email_subject="New fee bill generated",
+    )
+    db.commit()
+
+    return _voucher_out(db, voucher, student.full_name)
+
+
+@router.get("/vouchers/{voucher_id}/bill-pdf")
+def download_fee_bill_pdf(voucher_id: uuid.UUID, db: Session = Depends(get_db),
+                           current_user: User = Depends(get_current_user)):
+    """
+    Renders the voucher as a simple PDF on the fly — nothing is written to
+    disk. Unlike fee proofs (a real uploaded file that has to persist),
+    every field on this PDF already lives on the voucher/enrollment rows,
+    so regenerating it per request avoids adding a new storage path and a
+    new fee_vouchers column just to remember "where the PDF is."
+
+    NEW DEPENDENCY: this needs `reportlab` (not yet in this project — the
+    existing pypdf dependency only reads/recompresses PDFs, it doesn't
+    draw text). Add reportlab to requirements.txt before deploying this.
+
+    RBAC reuses _can_access_student_fees — the same student/parent/
+    admin/coordinator rule as every other read in this router.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas
+    import io
+
+    voucher = db.query(FeeVoucher).filter(FeeVoucher.id == voucher_id, FeeVoucher.deleted_at.is_(None)).first()
+    if not voucher:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Voucher not found")
+    if not _can_access_student_fees(current_user, voucher.student_id, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not permitted")
+
+    student = db.query(User).filter(User.id == voucher.student_id).first()
+    batch = db.query(Batch).filter(Batch.id == voucher.batch_id).first()
+    subject_names = [
+        s.name for s in (
+            db.query(Subject).filter(Subject.id == e.subject_id).first()
+            for e in db.query(Enrollment).filter(
+                Enrollment.student_id == voucher.student_id,
+                Enrollment.batch_id == voucher.batch_id,
+                Enrollment.status == "active",
+                Enrollment.deleted_at.is_(None),
+            ).all()
+        ) if s
+    ]
+    voucher_number = _voucher_number(voucher)
+    status_text = _status_text_for(_latest_proof_for(db, voucher.id))
+
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    y = height - 30 * mm
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(20 * mm, y, "Fee Bill / Voucher")
+    y -= 12 * mm
+
+    c.setFont("Helvetica", 11)
+    for line in [
+        f"Voucher No: {voucher_number}",
+        f"Student: {student.full_name if student else 'Unknown'}",
+        f"Batch: {batch.name if batch else 'Unknown'}",
+        f"Subjects: {', '.join(subject_names) if subject_names else '-'}",
+        f"Amount Payable: {voucher.amount}",
+        f"Due Date: {voucher.due_date.isoformat()}",
+        f"Generated: {voucher.generated_at.strftime('%Y-%m-%d %H:%M UTC')}",
+        f"Status: {status_text.capitalize()}",
+    ]:
+        c.drawString(20 * mm, y, line)
+        y -= 8 * mm
+
+    c.showPage()
+    c.save()
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{voucher_number}.pdf"'},
+    )
 
 
 @router.post("/proofs", response_model=FeeProofOut, status_code=status.HTTP_201_CREATED)

@@ -43,8 +43,18 @@ def _complaint_out(db: Session, complaint: Complaint) -> ComplaintOut:
 
 
 @router.post("", response_model=ComplaintOut, status_code=status.HTTP_201_CREATED)
-def submit_complaint(payload: ComplaintCreate, db: Session = Depends(get_db),
-                      current_user: User = Depends(require_roles("student", "parent", "teacher"))):
+def submit_complaint(
+    payload: ComplaintCreate, db: Session = Depends(get_db),
+    # S3.3 backend fix: also admits a Coordinator with a dual Teacher
+    # assignment (see RoleSwitchService/teacherPortalGuard on the
+    # frontend) submitting Teacher-style feedback while in Teacher mode.
+    # No separate assignment lookup needed — the "teacher" branch below
+    # (payload.student_id must be None) already applies identically to
+    # both, and list_complaints' submitted_by filter for their own
+    # submissions works the same regardless of which of the two roles
+    # made the request.
+    current_user: User = Depends(require_roles("student", "parent", "teacher", "coordinator")),
+):
     if current_user.role == "student" and current_user.id != payload.student_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Students may only submit on their own behalf")
     if current_user.role == "parent":
@@ -56,11 +66,15 @@ def submit_complaint(payload: ComplaintCreate, db: Session = Depends(get_db),
         ).first()
         if not link:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not linked to this student")
-    if current_user.role == "teacher" and payload.student_id is not None:
+    if current_user.role in ("teacher", "coordinator") and payload.student_id is not None:
         # A Teacher's feedback/complaint (Sub-Sprint 6.2) is general — about
         # a timetable clash, a policy question, etc — not about one student.
         # Reject rather than silently drop it, so the caller notices if it
-        # meant to submit a Student/Parent-style complaint instead.
+        # meant to submit a Student/Parent-style complaint instead. Applies
+        # to a dual-role Coordinator in Teacher mode exactly the same way —
+        # their own Coordinator identity already has full visibility into
+        # every complaint via list_complaints below, so there's no separate
+        # "Coordinator complaint about a student" flow this could be for.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                              detail="Teacher feedback isn't submitted on behalf of a specific student")
 

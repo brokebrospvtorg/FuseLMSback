@@ -12,11 +12,13 @@ from app.core.audit import log_action
 from app.core.notifications import notify
 from app.core.batch_utils import generate_batches
 from app.core.offering_utils import active_boards_for, active_boards_map
-from sqlalchemy import or_
+from app.core.security import guard_teacher_assignee_role
+from sqlalchemy import and_, or_
 
 from app.models import (
     Batch, Level, Subject, SubjectLevel, StudentLevelEnrollment, SubjectRequest, Enrollment,
     TeacherSubjectAssignment, BatchSubject, User, TimetableSlot, AttendanceRecord, Assessment, Mark,
+    TeacherProfile,
 )
 from app.schemas.academic import (
     BatchCreate, BatchUpdate, BatchOut, BatchTemplateOut, LevelOut, SubjectOut, SubjectCreate,
@@ -67,35 +69,35 @@ def list_batches(db: Session = Depends(get_db), current_user: User = Depends(get
     this reach for undefined fields (active_students_count didn't exist on
     BatchOut at all) instead of a real fix.
 
-    Ordering: a strict 4-tier priority, not a single ORDER BY column —
-    "how much is actually happening in this batch" outranks recency, which
-    outranks nothing at all:
-      1. is_active AND active_students_count > 0 — real, enrolled activity.
-         Sorted DESC by student count within this tier: the batch with the
-         most students is the one Coordinator/Admin need front and center.
-      2. is_active AND has at least one active board offering
-         (active_boards non-empty) but zero enrolled students yet — set up
-         and assigned to a board/stream, just not enrolled into yet.
-      3. is_active, but neither of the above — open, but nothing's
-         happened in it yet.
-      4. NOT is_active — archived/inactive, always last regardless of any
-         historical counts it might still carry.
-    Within every tier, year DESC then start_date DESC breaks ties so the
-    most recent batch in that tier sorts first (this REVERSES the old
-    single-column `year ASC` behavior on purpose — recency should rank a
-    batch UP, not down, once tier already reflects real activity).
+    Ordering (Coordinator Portal batch-ordering requirement): a strict
+    2-tier priority —
+      1. is_active == True — ACTIVE batches always come first, sorted
+         CHRONOLOGICALLY (year ASC, then start_date ASC as the same-year
+         tiebreaker) e.g. "2025 Active" before "2026 Active".
+      2. is_active == False — inactive/completed batches are always pushed
+         to the bottom, below every active batch regardless of year, also
+         chronological (year ASC, start_date ASC) within that group.
+
+    Deliberately NOT weighted by active_students_count / active_boards —
+    an earlier revision sorted active batches by "how much is happening in
+    them" (most-enrolled first) with year only as a tiebreaker. That
+    produced an order Coordinators found confusing/unpredictable (a
+    newer batch could jump above an older one just because it had more
+    enrollments), and doesn't match this requirement's explicit
+    chronological ordering. active_students_count/assigned_teachers_count/
+    active_boards are still computed and returned on every row (the Batch
+    Summary drawer and per-board "Active" tag both need them) — they're
+    just no longer part of the sort key.
 
     This is computed in Python over the already-fetched, already-decorated
-    BatchOut list rather than as a SQL ORDER BY ... CASE, because the tier
-    boundaries depend on active_students_count/active_boards, which are
-    themselves two separate grouped subqueries above, not real columns —
-    encoding the same logic as a correlated subquery inside ORDER BY would
-    just be this same computation, done twice, harder to read.
+    BatchOut list rather than as a SQL ORDER BY, so it stays in one place
+    and is trivial to unit test against the BatchOut list directly.
 
     Every board tab on the frontend (All Batches, British Council, Edexcel,
     LRN) filters this same already-ordered list rather than re-querying or
     re-sorting, so all four inherit this exact ordering for free — see
-    admin-batches.component.ts's filteredBatches/sortedBatches split.
+    admin-batches.component.ts's filteredBatches computed signal, which is
+    a deliberate pass-through of this order, never a re-sort.
     """
     student_counts = dict(
         db.query(Enrollment.batch_id, func.count(distinct(Enrollment.student_id)))
@@ -135,21 +137,11 @@ def list_batches(db: Session = Depends(get_db), current_user: User = Depends(get
         out.active_boards = active_boards_map.get(batch.id, [])
         result.append(out)
 
-    def _tier(b: BatchOut) -> int:
-        if b.is_active and b.active_students_count > 0:
-            return 0
-        if b.is_active and b.active_boards:
-            return 1
-        if b.is_active:
-            return 2
-        return 3
-
     result.sort(
         key=lambda b: (
-            _tier(b),
-            -b.active_students_count,  # tier 0: most-enrolled batch first
-            -b.year,                   # every tier: newest year first
-            b.start_date.toordinal() * -1,  # same-year tiebreaker: later start first
+            0 if b.is_active else 1,  # ACTIVE batches first, inactive always last
+            b.year,                   # chronological ASC within each group (2025 before 2026)
+            b.start_date,             # same-year tiebreaker, also chronological
         )
     )
     return result
@@ -271,9 +263,23 @@ def list_offered_subjects(batch_id: uuid.UUID, board: Optional[str] = None,
 
     query = (
         db.query(BatchSubject, Subject.name.label("subject_name"),
-                  Subject.level_id.label("level_id"), Level.name.label("level_name"))
+                  SubjectLevel.level_id.label("level_id"), Level.name.label("level_name"))
         .join(Subject, Subject.id == BatchSubject.subject_id)
-        .join(Level, Level.id == Subject.level_id)
+        # BUG FIX: was joined via Subject.level_id (the single "primary"
+        # level FK) — a multi-level subject (e.g. Physics offered under
+        # both O-Level and AS-Level, see SubjectLevel/schema_update_16b)
+        # would then only ever be reported under whichever level happened
+        # to be its primary one, making it invisible — and therefore
+        # un-assignable to a Teacher — in ManageBatchDialogComponent's
+        # Assign Teacher list for its other level(s), even after being
+        # successfully offered. subject_levels has one row per (subject,
+        # applicable level) pair for EVERY subject (schema_update_16b
+        # backfilled it for single-level subjects too), so joining through
+        # it here — instead of the single FK — naturally returns one row
+        # per level a multi-level subject actually belongs to, with
+        # single-level subjects behaving exactly as before (one row).
+        .join(SubjectLevel, SubjectLevel.subject_id == Subject.id)
+        .join(Level, Level.id == SubjectLevel.level_id)
         .filter(
             BatchSubject.batch_id == batch_id,
             BatchSubject.is_active.is_(True),
@@ -352,12 +358,17 @@ def offer_subjects_for_batch(batch_id: uuid.UUID, payload: OfferSubjectsPayload,
 
     # Return the batch's full current offered list (not just what this call
     # touched) — matches what GET returns, so the frontend can replace its
-    # whole "currently offered" panel from this one response.
+    # whole "currently offered" panel from this one response. Same
+    # SubjectLevel join as list_offered_subjects above, for the same
+    # multi-level-subject reason — kept in sync deliberately since this
+    # duplicates that query rather than calling it (this handler already
+    # has its own db.commit() boundary to return fresh post-write state).
     rows = (
         db.query(BatchSubject, Subject.name.label("subject_name"),
-                  Subject.level_id.label("level_id"), Level.name.label("level_name"))
+                  SubjectLevel.level_id.label("level_id"), Level.name.label("level_name"))
         .join(Subject, Subject.id == BatchSubject.subject_id)
-        .join(Level, Level.id == Subject.level_id)
+        .join(SubjectLevel, SubjectLevel.subject_id == Subject.id)
+        .join(Level, Level.id == SubjectLevel.level_id)
         .filter(BatchSubject.batch_id == batch_id, BatchSubject.is_active.is_(True))
         .order_by(Level.display_order, Subject.name)
         .all()
@@ -394,8 +405,29 @@ def assign_teacher_to_batch(batch_id: uuid.UUID, payload: AssignTeacherToBatchPa
     if not subject:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subject not found")
 
+    # Admin Role Isolation Guard: explicit, unfiltered lookup + guard first
+    # so an admin/superadmin id gets a clear 400 ("cannot be assigned as a
+    # Teacher") instead of a generic 404 that happens to fall out of the
+    # role-scoped eligibility query below. See app/core/security.py.
+    target_user = db.query(User).filter(User.id == payload.teacher_id, User.deleted_at.is_(None)).first()
+    if not target_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Teacher not found")
+    guard_teacher_assignee_role(target_user.role, context="a Teacher on a Subject/Batch assignment")
+
+    # Same dual-role allowance as GET /api/users?role=teacher (see that
+    # endpoint's comment) — a Coordinator who kept their teacher_profiles
+    # row from before being promoted is a legitimate Teacher assignee too,
+    # not just users whose current User.role is literally 'teacher'.
     teacher = db.query(User).filter(
-        User.id == payload.teacher_id, User.role == "teacher", User.deleted_at.is_(None),
+        User.id == payload.teacher_id,
+        or_(
+            User.role == "teacher",
+            and_(
+                User.role == "coordinator",
+                User.id.in_(db.query(TeacherProfile.user_id)),
+            ),
+        ),
+        User.deleted_at.is_(None),
     ).first()
     if not teacher:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Teacher not found")
@@ -460,19 +492,53 @@ def list_levels(db: Session = Depends(get_db), current_user: User = Depends(get_
 
 
 @router.get("/subjects", response_model=List[SubjectOut])
-def list_subjects(level_id: Optional[uuid.UUID] = None, db: Session = Depends(get_db),
+def list_subjects(level_id: Optional[uuid.UUID] = None, include_inactive: bool = False,
+                   db: Session = Depends(get_db),
                    current_user: User = Depends(get_current_user)):
-    """Subject catalog, optionally filtered to one Level (via the primary
-    level_id FK — kept for compatibility with existing callers). Powers
-    every subject dropdown in the app (Subject Requests, Teacher
-    Assignment, Enrollment, Offer Subjects)."""
+    """Subject catalog, optionally filtered to one Level. Powers every
+    subject dropdown in the app (Subject Requests, Teacher Assignment,
+    Enrollment, Offer Subjects).
+
+    include_inactive: every dropdown consumer wants active-only (the
+    default, unchanged). The Admin Subjects management screen is the one
+    exception — it passes include_inactive=true because its whole job is
+    activating/deactivating subjects, so it has to be able to see and
+    re-activate one that's already off. Without this, a deactivated
+    subject vanished from that screen too on the next reload, with no way
+    back in (see set_subject_status in routers/subjects.py — deactivate
+    is meant to be reversible, but wasn't reachable once hidden here).
+
+    BUG FIX: previously filtered ONLY on the primary Subject.level_id FK,
+    ignoring subject_levels entirely. A multi-level subject (e.g. Physics
+    checked for both O-Level AND AS-Level in the Add Subject dialog) has
+    level_id set to whichever level was picked first — schema_update_16b's
+    own comment on subject_levels says every additionally-selected level
+    "is additionally written to subject_levels", clearly intending those
+    subjects to be findable under any of their levels. Filtering only on
+    the primary FK meant such a subject was invisible in "Offer Subjects"
+    (and therefore un-offer-able, and therefore un-assignable to a
+    Teacher) for every level except the one that happened to be picked
+    first — this is why "add a teacher to a subject" could silently fail:
+    the subject the Coordinator wanted was never in the catalog dropdown
+    to begin with under the level they had selected. Now matches either
+    the primary FK or a subject_levels row for the requested level.
+    """
     query = (
         db.query(Subject, Level.name.label("level_name"))
         .join(Level, Level.id == Subject.level_id)
-        .filter(Subject.deleted_at.is_(None), Subject.is_active.is_(True))
+        .filter(Subject.deleted_at.is_(None))
     )
+    if not include_inactive:
+        query = query.filter(Subject.is_active.is_(True))
     if level_id:
-        query = query.filter(Subject.level_id == level_id)
+        query = query.filter(
+            or_(
+                Subject.level_id == level_id,
+                Subject.id.in_(
+                    db.query(SubjectLevel.subject_id).filter(SubjectLevel.level_id == level_id)
+                ),
+            )
+        )
     rows = query.order_by(Level.display_order, Subject.name).all()
 
     subject_ids = [subject.id for subject, _ in rows]
@@ -760,6 +826,16 @@ def list_enrollments(student_id: Optional[uuid.UUID] = None, subject_id: Optiona
 @router.post("/teacher-assignments", response_model=TeacherSubjectAssignmentOut, status_code=status.HTTP_201_CREATED)
 def assign_teacher(payload: TeacherSubjectAssignmentCreate, db: Session = Depends(get_db),
                     current_user: User = Depends(require_roles("admin", "coordinator"))):
+    # Admin Role Isolation Guard: fetch the target user and reject up front
+    # if they're an admin-tier account — this endpoint previously built the
+    # TeacherSubjectAssignment straight off payload.teacher_id with no role
+    # check at all, so any admin/superadmin user_id could be assigned as a
+    # Teacher. See app/core/security.py::guard_teacher_assignee_role.
+    target_user = db.query(User).filter(User.id == payload.teacher_id, User.deleted_at.is_(None)).first()
+    if not target_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Teacher not found")
+    guard_teacher_assignee_role(target_user.role, context="a Teacher on a Subject/Batch assignment")
+
     existing = db.query(TeacherSubjectAssignment).filter(
         TeacherSubjectAssignment.teacher_id == payload.teacher_id,
         TeacherSubjectAssignment.subject_id == payload.subject_id,
@@ -968,7 +1044,7 @@ def my_timetable_detailed(db: Session = Depends(get_db),
         .join(Subject, Subject.id == TimetableSlot.subject_id)
         .join(User, User.id == TimetableSlot.teacher_id)
         .filter(TimetableSlot.subject_id.in_(subject_ids), TimetableSlot.deleted_at.is_(None))
-        .order_by(TimetableSlot.day_of_week, TimetableSlot.period_number)
+        .order_by(TimetableSlot.day_of_week, TimetableSlot.start_time)
         .all()
     )
     return [
@@ -978,7 +1054,6 @@ def my_timetable_detailed(db: Session = Depends(get_db),
             subject_name=subject_name,
             teacher_name=teacher_name,
             day_of_week=slot.day_of_week,
-            period_number=slot.period_number,
             start_time=slot.start_time,
             end_time=slot.end_time,
         )

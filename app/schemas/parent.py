@@ -98,7 +98,6 @@ class ParentTimetableEntryOut(BaseModel):
     subject_name: str
     teacher_name: str
     day_of_week: str
-    period_number: int
     start_time: str
     end_time: str
 

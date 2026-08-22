@@ -23,6 +23,13 @@ class FeeVoucherOut(BaseModel):
     generated_at: datetime
     status: str  # pending | submitted | paid | rejected — matches frontend DerivedVoucherStatus
     latest_proof_id: Optional[uuid.UUID] = None  # what Approve/Reject actually act on
+    # Display-only invoice code (e.g. "INV-2026-3F9A21C4") for the Generate
+    # Fee Bill feature — NOT a stored column. fee_vouchers has no
+    # voucher-number field, so this is derived deterministically from the
+    # voucher's own id + generation year at read time (see
+    # routers/fees.py::_voucher_number). Stable for a given voucher, unique
+    # across vouchers, and needs no migration or sequence table.
+    voucher_number: str = ""
 
     class Config:
         from_attributes = True

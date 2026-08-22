@@ -1,4 +1,4 @@
-from sqlalchemy import Column, ForeignKey, TIMESTAMP, Date, Integer, Time, text
+from sqlalchemy import Column, ForeignKey, TIMESTAMP, Date, Time, text
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.core.database import Base
@@ -14,7 +14,6 @@ class TimetableSlot(Base):
     teacher_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     batch_id = Column(UUID(as_uuid=True), ForeignKey("batches.id"), nullable=False)
     day_of_week = Column(DayOfWeek, nullable=False)
-    period_number = Column(Integer, nullable=False)
     start_time = Column(Time, nullable=False)
     end_time = Column(Time, nullable=False)
     deleted_at = Column(TIMESTAMP(timezone=True))

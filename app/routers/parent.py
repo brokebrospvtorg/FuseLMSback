@@ -257,7 +257,7 @@ def child_timetable(student_id: uuid.UUID, db: Session = Depends(get_db),
         .join(Subject, Subject.id == TimetableSlot.subject_id)
         .join(User, User.id == TimetableSlot.teacher_id)
         .filter(TimetableSlot.subject_id.in_(subject_ids), TimetableSlot.deleted_at.is_(None))
-        .order_by(TimetableSlot.day_of_week, TimetableSlot.period_number)
+        .order_by(TimetableSlot.day_of_week, TimetableSlot.start_time)
         .all()
     )
 
@@ -265,7 +265,6 @@ def child_timetable(student_id: uuid.UUID, db: Session = Depends(get_db),
         ParentTimetableEntryOut(
             id=slot.id, subject_id=slot.subject_id, subject_name=subject_name,
             teacher_name=teacher_name, day_of_week=slot.day_of_week,
-            period_number=slot.period_number,
             start_time=slot.start_time.strftime("%H:%M"), end_time=slot.end_time.strftime("%H:%M"),
         )
         for slot, subject_name, teacher_name in rows

@@ -23,8 +23,13 @@ class UserCreate(BaseModel):
     email: EmailStr
     role: Literal["coordinator", "teacher", "student", "parent"]
     phone_number: Optional[str] = None
-    # Student-only optional fields at creation time:
-    roll_number: Optional[str] = None
+    # Student-only optional fields at creation time.
+    # Auto Roll Number: roll_number is NOT accepted here at all — it's
+    # always server-generated (format INK-{year}-XXXX, see
+    # users.py:_next_roll_number) the moment a student_profiles row is
+    # created, mirroring the existing Teacher Code convention exactly.
+    # (UserUpdate still has a roll_number field further down — that's the
+    # Edit Details/correction path for an already-existing student.)
     admission_date: Optional[date] = None
     father_name: Optional[str] = None
     date_of_birth: Optional[date] = None
@@ -32,6 +37,9 @@ class UserCreate(BaseModel):
     religion: Optional[str] = None
     nationality: Optional[str] = None
     cnic: Optional[str] = None
+    # Student-only: the student's own exam-board registration id (unrelated
+    # to a Parent's Reg ID below). Still caller-supplied — Auto Roll Number
+    # only covers roll_number, not this field.
     registration_id: Optional[str] = None
     # Student-only, REQUIRED when role == "student" (validated below): the
     # exam board this student is registered under. Optional at the schema
@@ -42,20 +50,51 @@ class UserCreate(BaseModel):
     # Teacher-only optional fields (gender/cnic reused above, shared shape):
     designation: Optional[str] = None
     hire_date: Optional[date] = None
-    teacher_code: Optional[str] = None
+    # Admin Teacher Creation: Teacher Code is NOT accepted here at all —
+    # it's always server-generated (format INK-T-XXXX, see
+    # users.py:_next_teacher_code) the moment a teacher_profiles row is
+    # created, so there's deliberately no field on this schema for a
+    # caller to set it manually. (UserUpdate still has a teacher_code
+    # field further down — that's the Edit Details/correction path for an
+    # already-existing teacher, out of scope for this change.)
     # Teacher-only, REQUIRED (at least one) when role == "teacher": the
     # board(s) this teacher is qualified to teach.
     boards: Optional[List[BoardEnum]] = None
-    # Student-only: link to an existing parent user
+    # ------------------------------------------------------------------
+    # Parent Link Flow (Student creation only): the Admin explicitly picks
+    # one of two paths in the UI — "Link Existing Parent" (parent_id
+    # required) or "Link Later" (parent_id omitted, no link created now;
+    # Link Parent from the Registry row action covers it afterwards). This
+    # field exists purely so a mis-wired frontend (parent_link_mode ==
+    # "existing" with no parent_id) is caught as a clean 422/400 instead of
+    # silently creating a student with no parent link and no error.
+    # ------------------------------------------------------------------
+    parent_link_mode: Optional[Literal["existing", "later"]] = None
     parent_id: Optional[uuid.UUID] = None
     relationship_label: Optional[str] = None
+    # ------------------------------------------------------------------
+    # Cascading Scope (Student creation only): Batch -> Level -> Subject,
+    # same three-stage shape as the existing Add Teacher initial-assignment
+    # cascade (newTeacherBatchId/newTeacherLevelId/newTeacherSubjectIds on
+    # the frontend). All optional — leaving batch_id unset creates the
+    # Student with no initial enrollment, exactly like today; Admin User
+    # Management (PATCH .../users/{id}) remains available afterwards
+    # either way. subject_ids requires batch_id + level_id to be
+    # meaningful (enforced below and in the router, same "validate before
+    # writing" pattern as update_user's level/subject block).
+    # ------------------------------------------------------------------
+    batch_id: Optional[uuid.UUID] = None
+    level_id: Optional[uuid.UUID] = None
+    subject_ids: Optional[List[uuid.UUID]] = None
     # Optional: Admin/Coordinator sets the account's first password directly
     # instead of the normal email-activation flow. When provided, the new
     # user is created status='active' immediately (skips the pending/token
     # step entirely) with must_change_password=True. When omitted (the
     # default, unchanged from before this sprint), account creation works
     # exactly as it did — status='pending', activation email sent, user
-    # picks their own first password.
+    # picks their own first password. Ignored entirely for role ==
+    # "student" (see DEFAULT_STUDENT_INITIAL_PASSWORD server-side, which
+    # always wins) and role == "teacher" (DEFAULT_TEACHER_INITIAL_PASSWORD).
     initial_password: Optional[str] = Field(default=None, min_length=8)
 
     @field_validator("boards")
@@ -70,12 +109,44 @@ class UserCreate(BaseModel):
             seen.setdefault(board, None)
         return list(seen.keys())
 
+    @field_validator("subject_ids")
+    @classmethod
+    def _dedupe_subject_ids(cls, v: Optional[List[uuid.UUID]]) -> Optional[List[uuid.UUID]]:
+        if v is None:
+            return v
+        seen: dict[uuid.UUID, None] = {}
+        for subject_id in v:
+            seen.setdefault(subject_id, None)
+        return list(seen.keys())
+
     @model_validator(mode="after")
     def _require_board_for_role(self) -> "UserCreate":
         if self.role == "student" and self.board is None:
             raise ValueError("board is required when creating a student")
         if self.role == "teacher" and not self.boards:
             raise ValueError("boards must include at least one board when creating a teacher")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_parent_link_flow(self) -> "UserCreate":
+        # Only meaningful for role == "student" — silently ignored (not
+        # errored) for every other role, same "role-agnostic at the schema
+        # level" convention as the rest of this shared payload.
+        if self.role == "student" and self.parent_link_mode == "existing" and self.parent_id is None:
+            raise ValueError('parent_id is required when parent_link_mode is "existing"')
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cascading_scope(self) -> "UserCreate":
+        # Shape-level check only (does the Batch/Level actually exist, is
+        # each subject_id real) happens in the router, same as the rest of
+        # this cascade's validation — this just guards against a Subject
+        # pick with no Batch/Level underneath it ever reaching the DB layer.
+        if self.role == "student" and self.subject_ids:
+            if self.batch_id is None:
+                raise ValueError("batch_id is required when subject_ids is provided")
+            if self.level_id is None:
+                raise ValueError("level_id is required when subject_ids is provided")
         return self
 
 
@@ -124,6 +195,15 @@ class UserUpdate(BaseModel):
     # a valid, explicit "unassign every subject", distinct from omitting the
     # field entirely (which leaves subjects untouched).
     level_id: Optional[uuid.UUID] = None
+    # Batch -> Level -> Subject cascade (Registry Cascading Dropdowns): the
+    # Batch that level_id/subject_ids resolve against, now an explicit,
+    # caller-supplied field. Previously omitted entirely from this schema —
+    # the router always resolved "the" batch itself via Batch.is_current,
+    # so a Student's subject enrollment could only ever be managed against
+    # whichever batch happened to be flagged current, never any other one.
+    # Optional/role-agnostic here, same convention as level_id/subject_ids;
+    # omit to leave existing batch-scoped enrollments untouched.
+    batch_id: Optional[uuid.UUID] = None
     subject_ids: Optional[List[uuid.UUID]] = None
 
     @field_validator("boards")

@@ -1,129 +1,227 @@
 """
-DEPRECATED (schema_update_11) — NOT mounted in app/main.py anymore.
+Admin Subjects module.
 
-This router implemented the old "Subject & Class Management" feature:
-free-form, batch-scoped subject creation that REQUIRED a subject code.
-The updated Academics workflow removes custom subject creation and
-subject codes entirely in favor of a pre-declared Cambridge catalog
-(see app/seeds/seed_subjects.py, GET /api/academic/subjects) plus
-GET /api/v1/batches/{batch_id}/summary (app/routers/batches.py) for the
-per-batch "active subjects & classes" view this feature used to cover.
+HISTORY: this filename previously held the schema_update_11-era "Subject &
+Class Management" router (free-form, batch-scoped subject creation with a
+required code, keyed off the old ClassSubject/class_subjects table). That
+feature was superseded by the pre-declared Cambridge subject catalog
+(app/models/academic.py:Subject, app/seeds/seed_subjects.py) and was left
+unmounted — see app/main.py's note and app/models/subject.py for that old
+model, which still exists only so historical class_subjects rows remain
+queryable directly. This file has been repurposed for the Admin Subjects
+screen and no longer touches ClassSubject at all.
 
-Left in place, unmounted, only so any historical class_subjects rows
-remain queryable directly against the DB if ever needed — no HTTP route
-in this app reaches this file anymore.
+SPLIT WITH app/routers/academic.py: GET/POST /api/academic/subjects
+(list + create the catalog) stay in academic.py, since they're read/create
+paths several non-admin screens depend on (Subject Requests, Teacher
+Assignment, Offer Subjects) and were already working there. This module
+adds the Admin-only mutations the Admin Subjects screen needs — edit,
+activate/deactivate, delete — under the SAME /api/academic/subjects
+prefix, on paths (/{id}, /{id}/status) that don't collide with those
+existing routes. Both routers get mounted in main.py; FastAPI merges them
+under one effective path tree.
 """
 import uuid
-from typing import List, Optional
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import require_roles, check_license
 from app.core.audit import log_action
-from app.models import Batch, ClassSubject, User
-from app.schemas.subject import ClassSubjectCreate, ClassSubjectOut, ClassLevelEnum
+from app.models import (
+    Subject, SubjectLevel, Level, BatchSubject, Enrollment,
+    TeacherSubjectAssignment, SubjectRequest, User,
+)
+from app.schemas.academic import SubjectOut, SubjectUpdate, SubjectStatusUpdate
 
-# NOTE: every other router in this project is mounted unversioned under
-# /api/<domain> (e.g. /api/academic, /api/academics — see
-# app/routers/academic.py's own docstring on that pair). This one is
-# deliberately mounted at /api/v1/subjects per this feature's spec; if the
-# rest of the API is ever versioned, this is the router to match against.
-router = APIRouter(prefix="/api/v1/subjects", tags=["subjects"], dependencies=[Depends(check_license)])
-
-
-@router.get("/class-levels", response_model=List[str])
-def list_class_levels(current_user: User = Depends(require_roles("admin", "coordinator"))):
-    """
-    The 4 fixed Class Level choices this feature is locked to — powers the
-    cascading form's second dropdown. Admin/Coordinator only, same as the
-    rest of this router; there's nothing here a Teacher/Student/Parent
-    needs, and 403-ing here too (rather than treating it as harmless
-    reference data) keeps every endpoint under this prefix consistently
-    gated.
-    """
-    return [level.value for level in ClassLevelEnum]
+router = APIRouter(
+    prefix="/api/academic/subjects", tags=["admin-subjects"],
+    dependencies=[Depends(check_license)],
+)
 
 
-@router.get("", response_model=List[ClassSubjectOut])
-def list_subjects(
-    batch_id: Optional[uuid.UUID] = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("admin", "coordinator")),
-):
-    """Optionally scoped to one Batch (?batch_id=...) — used by the
-    "Manage / Add Subjects" view opened from a specific Batch row."""
-    query = db.query(ClassSubject, Batch.name.label("batch_name")).join(
-        Batch, Batch.id == ClassSubject.batch_id
+def _load_subject_or_404(db: Session, subject_id: uuid.UUID) -> Subject:
+    subject = (
+        db.query(Subject)
+        .filter(Subject.id == subject_id, Subject.deleted_at.is_(None))
+        .first()
     )
-    if batch_id:
-        query = query.filter(ClassSubject.batch_id == batch_id)
+    if not subject:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subject not found")
+    return subject
 
-    rows = query.order_by(ClassSubject.created_at.desc()).all()
-    return [
-        ClassSubjectOut(
-            id=subject.id,
-            name=subject.name,
-            code=subject.code,
-            class_level=subject.class_level,
-            batch_id=subject.batch_id,
-            batch_name=batch_name,
-            description=subject.description,
-            created_at=subject.created_at,
+
+def _serialize(db: Session, subject: Subject) -> SubjectOut:
+    """Same enrichment GET/POST /api/academic/subjects do in academic.py —
+    duplicated rather than imported across router files to keep each
+    router's read path independent of the other's internals."""
+    levels = (
+        db.query(Level)
+        .join(SubjectLevel, SubjectLevel.level_id == Level.id)
+        .filter(SubjectLevel.subject_id == subject.id)
+        .order_by(Level.display_order)
+        .all()
+    )
+    primary_level = next((lvl for lvl in levels if lvl.id == subject.level_id), None)
+    if primary_level is None and subject.level_id:
+        primary_level = db.query(Level).filter(Level.id == subject.level_id).first()
+
+    return SubjectOut(
+        id=subject.id, name=subject.name, code=subject.code, board=subject.board,
+        is_active=subject.is_active, level_id=subject.level_id,
+        level_name=primary_level.name if primary_level else None,
+        levels=levels,
+    )
+
+
+@router.put("/{subject_id}", response_model=SubjectOut)
+def update_subject(
+    subject_id: uuid.UUID, payload: SubjectUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin")),
+):
+    """Edit Subject Name/Code. Admin-only (Coordinator can still create via
+    academic.py's POST, but renaming/re-coding an already-live catalog
+    entry — which can ripple into every batch/enrollment/assignment that
+    references it by name — is reserved for Admin on this screen)."""
+    subject = _load_subject_or_404(db, subject_id)
+
+    duplicate = (
+        db.query(Subject)
+        .filter(
+            Subject.id != subject_id,
+            Subject.deleted_at.is_(None),
+            or_(
+                func.lower(Subject.name) == payload.name.lower(),
+                func.lower(Subject.code) == payload.code.lower(),
+            ),
         )
-        for subject, batch_name in rows
-    ]
-
-
-@router.post("", response_model=ClassSubjectOut, status_code=status.HTTP_201_CREATED)
-def create_subject(
-    payload: ClassSubjectCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("admin", "coordinator")),
-):
-    """
-    Cascading order is enforced here, not just in the frontend form:
-    Batch must exist first, then Class Level + Subject Details are
-    persisted together in one row. Role check happens before any of that
-    — require_roles() 403s a Teacher/Student/Parent before the batch
-    lookup even runs.
-    """
-    batch = db.query(Batch).filter(Batch.id == payload.batch_id, Batch.deleted_at.is_(None)).first()
-    if not batch:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found")
-
-    subject = ClassSubject(
-        name=payload.name,
-        code=payload.code,
-        class_level=payload.class_level.value,
-        batch_id=payload.batch_id,
-        description=payload.description,
+        .first()
     )
-    db.add(subject)
-    try:
-        db.commit()
-    except Exception:
-        db.rollback()
+    if duplicate:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Subject code '{payload.code}' already exists for {batch.name}.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Another subject with this name or code already exists in the catalog.",
         )
-    db.refresh(subject)
+
+    old_value = {"name": subject.name, "code": subject.code}
+    subject.name = payload.name
+    subject.code = payload.code
 
     log_action(
-        db, current_user.id, "class_subject_created", "class_subjects", subject.id,
-        None,
-        {
-            "name": subject.name, "code": subject.code,
-            "class_level": subject.class_level, "batch_id": str(subject.batch_id),
-        },
+        db, current_user.id, "subject_updated", "subjects", subject.id,
+        old_value, {"name": subject.name, "code": subject.code},
     )
     db.commit()
+    db.refresh(subject)
 
-    return ClassSubjectOut(
-        id=subject.id, name=subject.name, code=subject.code,
-        class_level=subject.class_level, batch_id=subject.batch_id,
-        batch_name=batch.name, description=subject.description,
-        created_at=subject.created_at,
+    return _serialize(db, subject)
+
+
+@router.patch("/{subject_id}/status", response_model=SubjectOut)
+def set_subject_status(
+    subject_id: uuid.UUID, payload: SubjectStatusUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin")),
+):
+    """Activate/Deactivate. Reversible, unlike delete: an inactive subject
+    disappears from every "offer this subject" / enrollment / teacher-
+    assignment picker (list_subjects in academic.py filters on
+    is_active), but its history (past enrollments, marks, attendance tied
+    to it) is untouched and it can be flipped back on at any time."""
+    subject = _load_subject_or_404(db, subject_id)
+
+    if subject.is_active == payload.is_active:
+        return _serialize(db, subject)
+
+    old_value = {"is_active": subject.is_active}
+    subject.is_active = payload.is_active
+
+    log_action(
+        db, current_user.id,
+        "subject_activated" if payload.is_active else "subject_deactivated",
+        "subjects", subject.id, old_value, {"is_active": subject.is_active},
     )
+    db.commit()
+    db.refresh(subject)
+
+    return _serialize(db, subject)
+
+
+@router.delete("/{subject_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_subject(
+    subject_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin")),
+):
+    """Delete Subject — with dependency check. This is a soft delete
+    (deleted_at + is_active=False, same convention as every other entity
+    in this schema), and it's blocked entirely if anything real is tied
+    to the subject: batch offerings, student enrollments, teacher
+    assignments, or subject requests. Those rows carry FKs to subjects.id
+    with no ON DELETE behavior defined, and more importantly represent
+    real academic history (a student's enrollment record, a teacher's
+    assignment) that a Delete click shouldn't silently orphan or hide.
+    If any exist, the Admin is pointed at Deactivate instead — the
+    reversible, non-destructive alternative above.
+    """
+    subject = _load_subject_or_404(db, subject_id)
+
+    blockers: list[str] = []
+
+    offering_count = (
+        db.query(func.count(BatchSubject.id))
+        .filter(BatchSubject.subject_id == subject_id)
+        .scalar()
+    )
+    if offering_count:
+        blockers.append(f"{offering_count} batch offering(s)")
+
+    enrollment_count = (
+        db.query(func.count(Enrollment.id))
+        .filter(Enrollment.subject_id == subject_id, Enrollment.deleted_at.is_(None))
+        .scalar()
+    )
+    if enrollment_count:
+        blockers.append(f"{enrollment_count} active enrollment(s)")
+
+    assignment_count = (
+        db.query(func.count(TeacherSubjectAssignment.id))
+        .filter(
+            TeacherSubjectAssignment.subject_id == subject_id,
+            TeacherSubjectAssignment.deleted_at.is_(None),
+        )
+        .scalar()
+    )
+    if assignment_count:
+        blockers.append(f"{assignment_count} teacher assignment(s)")
+
+    request_count = (
+        db.query(func.count(SubjectRequest.id))
+        .filter(SubjectRequest.subject_id == subject_id, SubjectRequest.deleted_at.is_(None))
+        .scalar()
+    )
+    if request_count:
+        blockers.append(f"{request_count} subject request(s)")
+
+    if blockers:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Cannot delete '{subject.name}' — it's still referenced by "
+                f"{', '.join(blockers)}. Deactivate it instead to hide it from "
+                "new offerings while keeping this history intact."
+            ),
+        )
+
+    old_value = {"name": subject.name, "code": subject.code, "is_active": subject.is_active}
+    subject.deleted_at = datetime.now(timezone.utc)
+    subject.is_active = False
+
+    log_action(db, current_user.id, "subject_deleted", "subjects", subject.id, old_value, None)
+    db.commit()
+
+    return None
