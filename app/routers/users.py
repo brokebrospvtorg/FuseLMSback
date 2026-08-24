@@ -502,14 +502,18 @@ def get_user(
         elif user.role == "teacher":
             tp = db.query(TeacherProfile).filter(TeacherProfile.user_id == user.id).first()
             if tp:
-                boards_list = [
-                    tb.board for tb in
-                    db.query(TeacherBoard).filter(TeacherBoard.teacher_id == user.id).order_by(TeacherBoard.board).all()
-                ]
+                # Ensure we extract the string/enum value from TeacherBoard objects or use direct string values
+                raw_boards = db.query(TeacherBoard).filter(TeacherBoard.teacher_id == user.id).all()
+                boards_list = []
+                for tb in raw_boards:
+                    val = tb.board.value if hasattr(tb.board, "value") else tb.board
+                    boards_list.append(val)
+
                 levels_list = [
                     tl.level_id for tl in
                     db.query(TeacherLevel).filter(TeacherLevel.teacher_id == user.id).all()
                 ]
+                
                 detail.teacher_profile = TeacherProfileOut(
                     user_id=tp.user_id,
                     hire_date=tp.hire_date,
@@ -519,6 +523,7 @@ def get_user(
                     boards=boards_list,
                     level_ids=levels_list
                 )
+                
             else:
                 logger.error(
                     "Teacher %s has no teacher_profiles row — Edit Details will show blank profile fields.",
