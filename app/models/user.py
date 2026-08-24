@@ -55,15 +55,19 @@ class TeacherProfile(Base):
     __tablename__ = "teacher_profiles"
 
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    designation = Column(Text)
     hire_date = Column(Date)
     gender = Column(Text)
     cnic = Column(Text)
     teacher_code = Column(Text)
+    # designation Column REMOVED — see migration snippet below.
 
     user = relationship("User", back_populates="teacher_profile")
     boards = relationship(
         "TeacherBoard", back_populates="teacher_profile",
+        cascade="all, delete-orphan", passive_deletes=True,
+    )
+    levels = relationship(
+        "TeacherLevel", back_populates="teacher_profile",
         cascade="all, delete-orphan", passive_deletes=True,
     )
 
@@ -87,6 +91,24 @@ class TeacherBoard(Base):
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
 
     teacher_profile = relationship("TeacherProfile", back_populates="boards")
+
+class TeacherLevel(Base):
+    """
+    Teacher Multi-Level Assignment: which academic level(s) a Teacher is
+    assigned to teach. Join table (teacher_id, level_id), same shape/
+    reasoning as TeacherBoard — a normal queryable row per assignment,
+    not a Postgres array column.
+    """
+    __tablename__ = "teacher_levels"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    teacher_id = Column(
+        UUID(as_uuid=True), ForeignKey("teacher_profiles.user_id", ondelete="CASCADE"), nullable=False,
+    )
+    level_id = Column(UUID(as_uuid=True), ForeignKey("levels.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+    teacher_profile = relationship("TeacherProfile", back_populates="levels")
 
 
 class ParentProfile(Base):

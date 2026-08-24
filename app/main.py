@@ -9,7 +9,7 @@ from app.core.scheduler import start_scheduler, stop_scheduler
 from app.routers import (
     auth, users, academic, timetable, attendance, marks, fees, content,
     complaints, notifications, audit, system, student_grades, parent, batches,
-    subjects, password_requests,
+    subjects, password_requests, teachers,
 )
 
 app = FastAPI(
@@ -65,6 +65,7 @@ app.include_router(batches.router)
 # admin-only mutations on /api/academic/subjects/{id} and .../{id}/status.
 app.include_router(subjects.router)
 app.include_router(password_requests.router)
+app.include_router(teachers.router)
 
 
 @app.get("/api/health")

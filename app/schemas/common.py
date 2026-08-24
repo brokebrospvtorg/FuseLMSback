@@ -16,3 +16,21 @@ class BoardEnum(str, Enum):
     # schema_update_16: catalog Subjects only (POST /api/academic/subjects)
     # — not offered on Student/Teacher/Batch forms.
     ALL = "All"
+
+class GenderEnum(str, Enum):
+    MALE = "Male"
+    FEMALE = "Female"
+    OTHER = "Other"
+
+
+class ReligionEnum(str, Enum):
+    ISLAM = "Islam"
+    CHRISTIANITY = "Christianity"
+    HINDUISM = "Hinduism"
+    SIKHISM = "Sikhism"
+    OTHER = "Other"
+
+
+class NationalityEnum(str, Enum):
+    PAKISTANI = "Pakistani"
+    OTHER = "Other"

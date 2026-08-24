@@ -18,7 +18,7 @@ from app.core.audit import log_action
 from app.models import (
     User, StudentProfile, TeacherProfile, ParentProfile, ParentStudentLink,
     VerificationToken, CorrectionRequest, StudentLevelEnrollment, Level,
-    Subject, Enrollment, Batch, TeacherBoard,
+    Subject, Enrollment, Batch, TeacherBoard, TeacherLevel,
 )
 from app.schemas.user import (
     UserCreate, UserUpdate, UserOut, UserDetailOut, StudentProfileOut, TeacherProfileOut, ParentProfileOut,
@@ -276,7 +276,7 @@ def create_user(
         full_name=payload.full_name,
         email=payload.email,
         role=payload.role,
-        status="active" if effective_initial_password else "pending",
+        status="pending",  # ALWAYS pending now — see requirement 2
         phone_number=payload.phone_number,
         created_by=current_user.id,
     )
@@ -368,7 +368,7 @@ def create_user(
             savepoint = db.begin_nested()
             try:
                 db.add(TeacherProfile(
-                    user_id=user.id, designation=payload.designation, hire_date=payload.hire_date,
+                    user_id=user.id, hire_date=payload.hire_date,
                     gender=payload.gender, cnic=payload.cnic, teacher_code=teacher_code,
                 ))
                 db.flush()
@@ -385,6 +385,10 @@ def create_user(
         # board is set when role == "teacher".
         for board in payload.boards:
             db.add(TeacherBoard(teacher_id=user.id, board=board.value))
+        # UserCreate's model_validator already guarantees at least one
+        # level is set when role == "teacher".
+        for level_id in payload.level_ids:
+            db.add(TeacherLevel(teacher_id=user.id, level_id=level_id))
     elif payload.role == "parent":
         # Parent Link Flow: Parent Reg ID is always server-generated
         # (INK-P-XXXX), same retry-against-the-unique-constraint shape as
@@ -516,6 +520,10 @@ def get_user(
                     tb.board for tb in
                     db.query(TeacherBoard).filter(TeacherBoard.teacher_id == user.id).order_by(TeacherBoard.board).all()
                 ]
+                profile_out.level_ids = [
+                    tl.level_id for tl in
+                    db.query(TeacherLevel).filter(TeacherLevel.teacher_id == user.id).all()
+                ]
                 detail.teacher_profile = profile_out
             else:
                 # A teacher-role User with no teacher_profiles row (e.g. an
@@ -644,7 +652,7 @@ def update_user(
             elif payload.role == "teacher":
                 exists = db.query(TeacherProfile).filter(TeacherProfile.user_id == user.id).first()
                 if not exists:
-                    db.add(TeacherProfile(user_id=user.id, designation=None, hire_date=None))
+                    db.add(TeacherProfile(user_id=user.id, hire_date=None))
             elif payload.role == "parent":
                 exists = db.query(ParentProfile).filter(ParentProfile.user_id == user.id).first()
                 if not exists:
@@ -677,7 +685,7 @@ def update_user(
     elif user.role == "teacher":
         tp = db.query(TeacherProfile).filter(TeacherProfile.user_id == user.id).first()
         if tp:
-            for field in ("designation", "hire_date", "gender", "cnic", "teacher_code"):
+            for field in ("hire_date", "gender", "cnic", "teacher_code"):
                 value = getattr(payload, field)
                 if value is not None:
                     setattr(tp, field, value)
@@ -688,6 +696,11 @@ def update_user(
                 db.query(TeacherBoard).filter(TeacherBoard.teacher_id == user.id).delete()
                 for board in payload.boards:
                     db.add(TeacherBoard(teacher_id=user.id, board=board.value))
+            # ADD: level_ids full-replacement, same pattern as boards above.
+            if payload.level_ids is not None:
+                db.query(TeacherLevel).filter(TeacherLevel.teacher_id == user.id).delete()
+                for level_id in payload.level_ids:
+                    db.add(TeacherLevel(teacher_id=user.id, level_id=level_id))
     elif user.role == "parent":
         pp = db.query(ParentProfile).filter(ParentProfile.user_id == user.id).first()
         if pp:
@@ -1115,4 +1128,3 @@ def my_profile(db: Session = Depends(get_db), current_user: User = Depends(requi
         class_name = level.name if level else None
 
     return MyProfileOut(user=current_user, student_profile=student_profile, class_name=class_name)
-

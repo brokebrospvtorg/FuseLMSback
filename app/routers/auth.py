@@ -44,16 +44,17 @@ def login(request: Request, payload: LoginRequest, response: Response, db: Sessi
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
     if user.status == "pending":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your profile is pending activation. Please verify via email token."
-        )
+        if not (user.password_hash and user.must_change_password):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your profile is pending activation. Please verify via email token."
+            )
     elif user.status == "suspended":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account suspended due to policy violations."
         )
-    elif user.status != "active":
+    elif user.status != "active" and not (user.status == "pending" and user.must_change_password):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Account is {user.status}")
 
     token = create_access_token(str(user.id), user.role)
@@ -107,7 +108,6 @@ def verify_token(request: Request, payload: TokenVerifyRequest, db: Session = De
 @router.post("/submit-activation", response_model=UserOut)
 @limiter.limit("10/minute")
 def submit_activation(request: Request, payload: ActivationSubmitRequest, db: Session = Depends(get_db)):
-    """Step 5 of onboarding: pre-filled data was correct -> user sets password, status -> active."""
     vt = (
         db.query(VerificationToken)
         .filter(
@@ -130,6 +130,7 @@ def submit_activation(request: Request, payload: ActivationSubmitRequest, db: Se
 
     user.password_hash = hash_password(payload.password)
     user.status = "active"
+    user.must_change_password = False
     vt.used_at = datetime.now(timezone.utc)
 
     try:
@@ -150,7 +151,6 @@ def submit_activation(request: Request, payload: ActivationSubmitRequest, db: Se
 def submit_correction_on_activation(
     request: Request, payload: CorrectionOnActivationRequest, db: Session = Depends(get_db)
 ):
-    """Step 6: pre-filled data was wrong -> raise a correction_request; account stays pending."""
     vt = (
         db.query(VerificationToken)
         .filter(
@@ -177,7 +177,6 @@ def submit_correction_on_activation(
 @limiter.limit("5/minute")
 def request_password_reset(request: Request, payload: PasswordResetRequestSchema, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == payload.email, User.deleted_at.is_(None)).first()
-    # Always return 200 regardless of whether the email exists, to avoid user enumeration.
     if user and user.status == "active":
         token_str = generate_verification_token()
         vt = VerificationToken(
@@ -198,18 +197,6 @@ def request_password_reset(request: Request, payload: PasswordResetRequestSchema
 def request_password_reset_approval(
     request: Request, payload: AdminPasswordResetRequestCreate, db: Session = Depends(get_db),
 ):
-    """
-    Logged-out 'Request Password Reset from Admin' button — a second,
-    manual-review path alongside the email-token flow above
-    (POST /request-password-reset). For when the account can't reliably
-    receive email, the identifier accepted here is free text: email,
-    Student roll number, or Teacher employee code, matched in that order.
-
-    Same user-enumeration stance as the email-token endpoint: whether or
-    not the identifier matches an account, this always returns the same
-    generic success response — an Admin reviewing the (possibly
-    unresolvable) queue entry is the only place that distinction surfaces.
-    """
     identifier = payload.identifier.strip()
 
     user = (
@@ -236,11 +223,6 @@ def request_password_reset_approval(
         if teacher:
             user = db.query(User).filter(User.id == teacher.user_id).first()
 
-    # A request row needs a user_id, so an identifier that matches no
-    # account genuinely can't be recorded — there's nothing for an Admin
-    # to review. The response text is identical either way, though, so a
-    # caller probing identifiers learns nothing from it about whether a
-    # match was found.
     if user and user.status == "active":
         existing_pending = (
             db.query(PasswordResetRequest)
@@ -297,14 +279,6 @@ def change_password(
     request: Request, payload: ChangePasswordRequest,
     db: Session = Depends(get_db), current_user: User = Depends(get_current_user),
 ):
-    """
-    Self-service change for a LOGGED-IN user who knows their current
-    password. Distinct from both existing password paths:
-      - submit-activation / submit-password-reset: prove control of the
-        email inbox via a token, no current password needed.
-      - this endpoint: prove you ARE the account by supplying the current
-        password, no email/token round-trip needed.
-    """
     if not current_user.password_hash or not verify_password(payload.current_password, current_user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Current password is incorrect")
 
@@ -316,5 +290,7 @@ def change_password(
 
     current_user.password_hash = hash_password(payload.new_password)
     current_user.must_change_password = False
+    if current_user.status == "pending":
+        current_user.status = "active"
     db.commit()
     return {"detail": "Password changed successfully."}
