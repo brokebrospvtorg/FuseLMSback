@@ -157,7 +157,7 @@ def list_slots(
         .join(Subject, Subject.id == TimetableSlot.subject_id)
         .join(teacher, teacher.id == TimetableSlot.teacher_id)
         .join(Batch, Batch.id == TimetableSlot.batch_id)
-        .filter(TimetableSlot.deleted_at.is_(None))
+        .filter(TimetableSlot.deleted_at.is_(None), teacher.deleted_at.is_(None))
     )
     if batch_id:
         query = query.filter(TimetableSlot.batch_id == batch_id)
@@ -296,7 +296,11 @@ def my_timetable(db: Session = Depends(get_db), current_user: User = Depends(req
         .join(Subject, Subject.id == TimetableSlot.subject_id)
         .join(teacher, teacher.id == TimetableSlot.teacher_id)
         .join(Batch, Batch.id == TimetableSlot.batch_id)
-        .filter(TimetableSlot.subject_id.in_(subject_ids), TimetableSlot.deleted_at.is_(None))
+        .filter(
+            TimetableSlot.subject_id.in_(subject_ids),
+            TimetableSlot.deleted_at.is_(None),
+            teacher.deleted_at.is_(None),
+        )
         .order_by(TimetableSlot.day_of_week, TimetableSlot.start_time)
         .all()
     )

@@ -914,10 +914,12 @@ def list_teacher_assignments(
         db.query(TeacherSubjectAssignment)
         .join(Batch, Batch.id == TeacherSubjectAssignment.batch_id)
         .join(Subject, Subject.id == TeacherSubjectAssignment.subject_id)
+        .join(User, User.id == TeacherSubjectAssignment.teacher_id)
         .filter(
             TeacherSubjectAssignment.deleted_at.is_(None),
             Batch.deleted_at.is_(None),
             Subject.deleted_at.is_(None),
+            User.deleted_at.is_(None),
         )
     )
     if current_user.role == "teacher":
@@ -956,9 +958,11 @@ def teacher_assignments_for_registry(teacher_id: uuid.UUID, db: Session = Depend
         db.query(TeacherSubjectAssignment, Subject.name.label("subject_name"), Batch.name.label("batch_name"))
         .join(Subject, Subject.id == TeacherSubjectAssignment.subject_id)
         .join(Batch, Batch.id == TeacherSubjectAssignment.batch_id)
+        .join(User, User.id == TeacherSubjectAssignment.teacher_id)
         .filter(
             TeacherSubjectAssignment.teacher_id == teacher_id,
             TeacherSubjectAssignment.deleted_at.is_(None),
+            User.deleted_at.is_(None),
         )
         .order_by(Batch.year.desc(), Subject.name)
         .all()

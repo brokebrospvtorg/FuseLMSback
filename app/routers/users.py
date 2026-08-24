@@ -19,6 +19,7 @@ from app.models import (
     User, StudentProfile, TeacherProfile, ParentProfile, ParentStudentLink,
     VerificationToken, CorrectionRequest, StudentLevelEnrollment, Level,
     Subject, Enrollment, Batch, TeacherBoard, TeacherLevel,
+    TeacherSubjectAssignment, TimetableSlot,
 )
 from app.schemas.user import (
     UserCreate, UserUpdate, UserOut, UserDetailOut, StudentProfileOut, TeacherProfileOut, ParentProfileOut,
@@ -845,7 +846,53 @@ def soft_delete_user(
     user = db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    user.deleted_at = datetime.now(timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    user.deleted_at = now
+
+    # Cascade Deactivation: a soft-deleted Teacher (or a Coordinator who
+    # still holds a teacher_profiles row — same dual-role definition used
+    # by the workload-summary/list_users(role="teacher") queries) must
+    # disappear from every teacher-facing list immediately, not just stop
+    # matching User.deleted_at.is_(None) on its own. Query-side filtering
+    # (workload summary, timetable, batch drawers, teacher-assignments)
+    # is the primary defense — this cascade is the belt-and-suspenders
+    # backstop so a query that forgets the join still can't leak a
+    # deleted teacher's schedule or assignments.
+    has_teacher_profile = (
+        db.query(TeacherProfile.user_id).filter(TeacherProfile.user_id == user.id).first()
+        is not None
+    )
+    if has_teacher_profile:
+        assignments_closed = (
+            db.query(TeacherSubjectAssignment)
+            .filter(
+                TeacherSubjectAssignment.teacher_id == user.id,
+                TeacherSubjectAssignment.deleted_at.is_(None),
+            )
+            .update({TeacherSubjectAssignment.deleted_at: now}, synchronize_session=False)
+        )
+        slots_closed = (
+            db.query(TimetableSlot)
+            .filter(
+                TimetableSlot.teacher_id == user.id,
+                TimetableSlot.deleted_at.is_(None),
+            )
+            .update({TimetableSlot.deleted_at: now}, synchronize_session=False)
+        )
+        # TeacherBoard / TeacherLevel carry no deleted_at column (they're
+        # pure qualification join rows, same convention noted on
+        # TeacherWorkloadSummary) — hard-deleted here, same
+        # full-replacement pattern already used for a Teacher's role
+        # switch above (db.query(TeacherBoard)...delete()).
+        db.query(TeacherBoard).filter(TeacherBoard.teacher_id == user.id).delete(synchronize_session=False)
+        db.query(TeacherLevel).filter(TeacherLevel.teacher_id == user.id).delete(synchronize_session=False)
+
+        log_action(db, current_user.id, "teacher_cascade_deactivated", "users", user.id, None, {
+            "assignments_closed": assignments_closed,
+            "timetable_slots_closed": slots_closed,
+        })
+
     log_action(db, current_user.id, "user_soft_deleted", "users", user.id, None, None)
     db.commit()
     return None

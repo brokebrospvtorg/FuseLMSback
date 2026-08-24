@@ -10,20 +10,26 @@ for one screen rather than a general user list.
 """
 import uuid
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Dict, List
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import or_
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import or_, and_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import require_roles, check_license
+from app.core.audit import log_action
+from app.core.offering_utils import active_boards_for
+from app.core.security import guard_teacher_assignee_role
 from app.models import (
     User, TeacherProfile, TeacherBoard, TeacherLevel, Level,
     TeacherSubjectAssignment, Subject, Batch,
 )
+from app.schemas.academic import TeacherSubjectAssignmentOut
 from app.schemas.teacher import (
     TeacherWorkloadSummaryOut, TeacherWorkloadLevelOut, TeacherWorkloadAssignmentOut,
+    TeacherAssignmentCreateRequest,
 )
 
 router = APIRouter(prefix="/api/teachers", tags=["teachers"], dependencies=[Depends(check_license)])
@@ -139,3 +145,180 @@ def get_teacher_workload_summary(
             active_batches_count=len({a.batch_id for a in assignments}),
         ))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Workload Management — add/remove one Teacher's batch/subject assignments.
+#
+# Deliberately teacher-scoped (mounted under /api/teachers/{teacher_id}/...)
+# rather than living only on the generic /api/academic/teacher-assignments
+# collection — this is the Teachers sidebar's own "manage this teacher's
+# workload" action, so teacher_id belongs in the URL, not repeated in every
+# request body. Both endpoints write/soft-delete the exact same
+# teacher_subject_assignments row the academic.py endpoints do — there's
+# only ever one table — so a change made here shows up immediately in GET
+# /api/academic/teacher-assignments, the Registry, and workload-summary
+# above, with no separate sync step.
+# ---------------------------------------------------------------------------
+def _resolve_assignable_teacher(db: Session, teacher_id: uuid.UUID) -> User:
+    """Shared eligibility check for both endpoints below — same rules as
+    assign_teacher_to_batch in app/routers/academic.py:
+      1. Must resolve to a real, non-deleted user at all (else 404) —
+         checked unfiltered-by-role first so an admin/superadmin id gets a
+         clear 400 from the guard below instead of an incidental 404.
+      2. Must not be an admin-tier account (guard_teacher_assignee_role).
+      3. Must actually be eligible as a Teacher assignee: role == 'teacher',
+         OR role == 'coordinator' who still holds a teacher_profiles row
+         (dual-role — same definition used everywhere else a teacher_id is
+         accepted, so this endpoint never disagrees with GET
+         /api/users?role=teacher on who counts as a Teacher).
+    """
+    target_user = db.query(User).filter(User.id == teacher_id, User.deleted_at.is_(None)).first()
+    if not target_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Teacher not found")
+    guard_teacher_assignee_role(target_user.role, context="a Teacher on a Subject/Batch assignment")
+
+    teacher = db.query(User).filter(
+        User.id == teacher_id,
+        or_(
+            User.role == "teacher",
+            and_(
+                User.role == "coordinator",
+                User.id.in_(db.query(TeacherProfile.user_id)),
+            ),
+        ),
+        User.deleted_at.is_(None),
+    ).first()
+    if not teacher:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Teacher not found")
+    return teacher
+
+
+@router.post(
+    "/{teacher_id}/assignments",
+    response_model=TeacherSubjectAssignmentOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def assign_subject_batch_to_teacher(
+    teacher_id: uuid.UUID,
+    payload: TeacherAssignmentCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "coordinator")),
+):
+    """
+    Workload Management — add one (subject, batch) combination to this
+    Teacher. Validates, in order:
+      1. teacher_id resolves to a real, eligible Teacher assignee.
+      2. subject_id / batch_id both resolve to real, non-deleted rows.
+      3. The subject actually has an ACTIVE offering for this batch
+         (BatchSubject) — same guard as every other assignment-creating
+         endpoint (see active_boards_for's docstring for why: without
+         this, the assignment would show up in the Teacher's own
+         cascading dropdowns for a batch/subject that was never really
+         offered, or whose offering was withdrawn).
+      4. No duplicate: an ACTIVE (non-deleted) assignment for this exact
+         (teacher, subject, batch) triple already means "already
+         assigned" -> 409.
+
+    Soft-deletion handling: teacher_subject_assignments carries a DB-level
+    unique constraint on (teacher_id, subject_id, batch_id) — NOT scoped to
+    only non-deleted rows. So if this exact triple was assigned before and
+    later removed (DELETE below, which soft-deletes), a plain INSERT here
+    would collide with that still-present-but-deleted row and raise an
+    unhandled IntegrityError (500). Instead: if a soft-deleted row for this
+    triple exists, REVIVE it (clear deleted_at, refresh assigned_by/
+    assigned_at) instead of inserting a duplicate — same pattern already
+    used for re-linking a Parent to a Student in
+    app/routers/users.py::create_parent_link.
+    """
+    teacher = _resolve_assignable_teacher(db, teacher_id)
+
+    subject = db.query(Subject).filter(Subject.id == payload.subject_id, Subject.deleted_at.is_(None)).first()
+    if not subject:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subject not found")
+
+    batch = db.query(Batch).filter(Batch.id == payload.batch_id, Batch.deleted_at.is_(None)).first()
+    if not batch:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found")
+
+    existing = db.query(TeacherSubjectAssignment).filter(
+        TeacherSubjectAssignment.teacher_id == teacher_id,
+        TeacherSubjectAssignment.subject_id == payload.subject_id,
+        TeacherSubjectAssignment.batch_id == payload.batch_id,
+    ).first()
+
+    if existing and existing.deleted_at is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This teacher is already assigned to this subject/batch.")
+
+    boards = active_boards_for(db, payload.batch_id, payload.subject_id)
+    if not boards:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This subject has no active offering for this batch. Offer the subject for this "
+                   "batch (and board) before assigning a teacher to it.",
+        )
+
+    if existing:
+        # Revive rather than insert — see docstring above.
+        existing.deleted_at = None
+        existing.assigned_by = current_user.id
+        existing.assigned_at = datetime.now(timezone.utc)
+        log_action(db, current_user.id, "teacher_assignment_revived", "teacher_subject_assignments", existing.id,
+                   None, {"teacher_id": str(teacher_id), "subject_id": str(payload.subject_id), "batch_id": str(payload.batch_id)})
+        db.commit()
+        db.refresh(existing)
+        assignment = existing
+    else:
+        assignment = TeacherSubjectAssignment(
+            assigned_by=current_user.id, teacher_id=teacher_id,
+            subject_id=payload.subject_id, batch_id=payload.batch_id,
+        )
+        db.add(assignment)
+        db.flush()  # populate assignment.id (server_default) before logging it
+        log_action(db, current_user.id, "teacher_assigned", "teacher_subject_assignments", assignment.id,
+                   None, {"teacher_id": str(teacher_id), "subject_id": str(payload.subject_id), "batch_id": str(payload.batch_id)})
+        db.commit()
+        db.refresh(assignment)
+
+    return TeacherSubjectAssignmentOut(
+        id=assignment.id, teacher_id=assignment.teacher_id, subject_id=assignment.subject_id,
+        batch_id=assignment.batch_id, assigned_by=assignment.assigned_by, assigned_at=assignment.assigned_at,
+        board=sorted(boards)[0],
+    )
+
+
+@router.delete("/{teacher_id}/assignments/{assignment_id}", status_code=status.HTTP_204_NO_CONTENT)
+def unassign_subject_batch_from_teacher(
+    teacher_id: uuid.UUID,
+    assignment_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "coordinator")),
+):
+    """
+    Workload Management — remove one (subject, batch) assignment from this
+    Teacher. Soft-delete only (deleted_at set), same convention as every
+    other assignment/link table in this schema — never a hard DELETE, so
+    the row (and its assigned_by/assigned_at history) is still there for
+    audit purposes, just excluded from every active-assignment query
+    (workload-summary, GET /teacher-assignments, batch drawers, Timetable
+    Builder's Teacher Assignee dropdown, etc.).
+
+    assignment_id is scoped to teacher_id in the same filter (not looked up
+    by id alone, then checked) — an assignment_id that's real but belongs
+    to a DIFFERENT teacher 404s exactly the same as one that doesn't exist
+    at all, rather than leaking "this id exists, just not for this
+    teacher" as a distinct error.
+    """
+    assignment = db.query(TeacherSubjectAssignment).filter(
+        TeacherSubjectAssignment.id == assignment_id,
+        TeacherSubjectAssignment.teacher_id == teacher_id,
+        TeacherSubjectAssignment.deleted_at.is_(None),
+    ).first()
+    if not assignment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assignment not found")
+
+    assignment.deleted_at = datetime.now(timezone.utc)
+    log_action(db, current_user.id, "teacher_unassigned", "teacher_subject_assignments", assignment.id,
+               {"teacher_id": str(teacher_id), "subject_id": str(assignment.subject_id), "batch_id": str(assignment.batch_id)}, None)
+    db.commit()
+    return None

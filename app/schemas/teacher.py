@@ -39,3 +39,12 @@ class TeacherWorkloadSummaryOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class TeacherAssignmentCreateRequest(BaseModel):
+    """POST /api/teachers/{teacher_id}/assignments — Workload Management is
+    inherently teacher-scoped (teacher_id comes from the URL path, same
+    convention as AssignTeacherToBatchPayload in schemas/academic.py), so
+    the body only carries the batch/subject combination being added."""
+    subject_id: uuid.UUID
+    batch_id: uuid.UUID

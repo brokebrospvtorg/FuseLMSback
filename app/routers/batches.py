@@ -86,6 +86,7 @@ def get_batch_summary(
         .filter(
             TeacherSubjectAssignment.batch_id == batch_id,
             TeacherSubjectAssignment.deleted_at.is_(None),
+            User.deleted_at.is_(None),
         )
         .all()
     )
