@@ -57,8 +57,20 @@ def create_batch(payload: BatchCreate, db: Session = Depends(get_db),
 
 
 @router.get("/batches", response_model=List[BatchOut])
-def list_batches(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def list_batches(
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
+    active_only: opt-in filter (default False, so the Admin Batches
+    management screen and the Add Teacher cascade keep seeing every
+    non-deleted batch, active or not — they need the full list to
+    manage/toggle status). Pass active_only=true to scope results to
+    Batch.is_active.is_(True) — used by the Add Student "Initial
+    Enrollment" batch dropdown, which should never offer a batch that's
+    already been marked inactive/completed.
+
     active_students_count / assigned_teachers_count: same filter
     conditions as the per-batch GET /{batch_id}/summary endpoint in
     routers/batches.py (Enrollment.status == "active", deleted_at IS NULL
@@ -127,7 +139,10 @@ def list_batches(db: Session = Depends(get_db), current_user: User = Depends(get
     for batch_id, board in board_rows:
         active_boards_map.setdefault(batch_id, []).append(board)
 
-    batches = db.query(Batch).filter(Batch.deleted_at.is_(None)).all()
+    batches_query = db.query(Batch).filter(Batch.deleted_at.is_(None))
+    if active_only:
+        batches_query = batches_query.filter(Batch.is_active.is_(True))
+    batches = batches_query.all()
 
     result = []
     for batch in batches:
@@ -570,7 +585,8 @@ def create_subject(payload: SubjectCreate, db: Session = Depends(get_db),
     """
     Admin/Coordinator: add a new catalog Subject and map it to one or
     more of the 4 standardized Levels (schema_update_16). Rejects a
-    duplicate name OR code, case-insensitively, before writing anything.
+    duplicate `code`, case-insensitively, before writing anything.
+    Duplicate names are allowed — `code` is the unique catalog key.
     """
     valid_levels = (
         db.query(Level)
@@ -592,17 +608,14 @@ def create_subject(payload: SubjectCreate, db: Session = Depends(get_db),
         db.query(Subject)
         .filter(
             Subject.deleted_at.is_(None),
-            or_(
-                func.lower(Subject.name) == payload.name.lower(),
-                func.lower(Subject.code) == payload.code.lower(),
-            ),
+            func.lower(Subject.code) == payload.code.lower(),
         )
         .first()
     )
     if duplicate:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Subject with this name or code already exists in the catalog.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Subject with this code already exists",
         )
 
     # level_id stays populated (first selected level) purely so existing

@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, or_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -86,7 +86,10 @@ def update_subject(
     """Edit Subject Name/Code. Admin-only (Coordinator can still create via
     academic.py's POST, but renaming/re-coding an already-live catalog
     entry — which can ripple into every batch/enrollment/assignment that
-    references it by name — is reserved for Admin on this screen)."""
+    references it by name — is reserved for Admin on this screen).
+
+    Duplicate validation is restricted to `code`, which is the unique
+    catalog key — duplicate/similar names are allowed."""
     subject = _load_subject_or_404(db, subject_id)
 
     duplicate = (
@@ -94,17 +97,14 @@ def update_subject(
         .filter(
             Subject.id != subject_id,
             Subject.deleted_at.is_(None),
-            or_(
-                func.lower(Subject.name) == payload.name.lower(),
-                func.lower(Subject.code) == payload.code.lower(),
-            ),
+            func.lower(Subject.code) == payload.code.lower(),
         )
         .first()
     )
     if duplicate:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Another subject with this name or code already exists in the catalog.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Subject with this code already exists",
         )
 
     old_value = {"name": subject.name, "code": subject.code}
