@@ -491,7 +491,24 @@ def get_user(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     try:
-        detail = UserDetailOut.model_validate(user)
+        # Deliberately NOT `UserDetailOut.model_validate(user)` here.
+        # UserDetailOut adds student_profile/teacher_profile/parent_profile
+        # on top of UserOut's scalar columns, and with from_attributes=True
+        # Pydantic eagerly resolves EVERY field via getattr(user, ...) —
+        # including `user.teacher_profile`, a live SQLAlchemy relationship.
+        # It then recurses into TeacherProfileOut, which does the same for
+        # `teacher_profile.boards` — a relationship returning raw
+        # TeacherBoard ROW objects, not BoardEnum values — and blows up
+        # trying to coerce a TeacherBoard instance into a BoardEnum member.
+        # That crash happens right here, before the role-specific blocks
+        # below (which build each profile correctly from a targeted query)
+        # ever get a chance to run and overwrite it.
+        #
+        # UserOut has no profile fields, so validating against it only
+        # touches plain columns — no relationship traversal, nothing to
+        # blow up on. The three profile fields are left at their Optional
+        # defaults (None) and filled in explicitly below, per role.
+        detail = UserDetailOut(**UserOut.model_validate(user).model_dump())
         if user.role == "student":
             sp = db.query(StudentProfile).filter(StudentProfile.user_id == user.id).first()
             if not sp:
