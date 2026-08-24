@@ -477,29 +477,16 @@ def list_users(
         query = query.filter(User.role == role)
     return query.order_by(User.created_at.desc()).all()
 
-
 @router.get("/{user_id}", response_model=UserDetailOut)
 def get_user(
     user_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # 5.1 hardening: previously only Student/Parent were blocked from
-    # viewing someone else's record, which meant Teacher could fetch ANY
-    # user by ID one at a time — a real gap against "Teacher cannot view
-    # information registry" (list_users already correctly restricts the
-    # full list to admin/coordinator; this single-record lookup didn't).
-    # Now: view your own record, or be Admin/Coordinator.
     if current_user.id != user_id and current_user.role not in ("admin", "coordinator"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not permitted to view this user")
     user = db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
     if not user:
-        # user_id here is always a real users.id (this is what the Registry
-        # table's row.id already is — see admin-registry.component.ts's
-        # openEditDetailsDialog(user), which passes the same RegistryUser.id
-        # straight through). A 404 this specific — not a generic 500 —
-        # is what lets the frontend tell "record was deleted/never existed"
-        # apart from "something broke while loading it" (handled below).
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     try:
@@ -515,25 +502,24 @@ def get_user(
         elif user.role == "teacher":
             tp = db.query(TeacherProfile).filter(TeacherProfile.user_id == user.id).first()
             if tp:
-                profile_out = TeacherProfileOut.model_validate(tp)
-                profile_out.boards = [
+                boards_list = [
                     tb.board for tb in
                     db.query(TeacherBoard).filter(TeacherBoard.teacher_id == user.id).order_by(TeacherBoard.board).all()
                 ]
-                profile_out.level_ids = [
+                levels_list = [
                     tl.level_id for tl in
                     db.query(TeacherLevel).filter(TeacherLevel.teacher_id == user.id).all()
                 ]
-                detail.teacher_profile = profile_out
+                detail.teacher_profile = TeacherProfileOut(
+                    user_id=tp.user_id,
+                    hire_date=tp.hire_date,
+                    gender=tp.gender,
+                    cnic=tp.cnic,
+                    teacher_code=tp.teacher_code,
+                    boards=boards_list,
+                    level_ids=levels_list
+                )
             else:
-                # A teacher-role User with no teacher_profiles row (e.g. an
-                # account created before the profile insert completed, or a
-                # migration gap) isn't a 404 — the User itself is real and
-                # the base fields above are still valid to return — but it
-                # IS the exact "Edit Teacher" symptom this was reported as:
-                # the dialog opens, then the request fails/looks empty with
-                # no indication why. Logged here so it shows up server-side
-                # instead of only as a silent None the admin can't diagnose.
                 logger.error(
                     "Teacher %s has no teacher_profiles row — Edit Details will show blank profile fields.",
                     user.id,
@@ -544,12 +530,6 @@ def get_user(
             detail.parent_profile = ParentProfileOut.model_validate(pp) if pp else None
         return detail
     except ValidationError:
-        # A profile row that doesn't satisfy its own schema (e.g. a legacy
-        # board value on teacher_boards that predates the current BoardEnum)
-        # would otherwise surface as an opaque 500 with no detail — exactly
-        # the "schema mismatch" case called out for this endpoint. Log the
-        # full trace for diagnosis, but still tell the caller specifically
-        # what happened rather than a bare Internal Server Error.
         logger.exception("GET /api/users/%s: profile data failed schema validation.", user_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -561,7 +541,6 @@ def get_user(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not load this user's details right now. Please try again.",
         )
-
 
 @router.patch("/{user_id}", response_model=UserOut)
 def update_user(
