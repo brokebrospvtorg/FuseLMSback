@@ -1,10 +1,17 @@
 import uuid
 from datetime import date, datetime, time
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel
 
 from app.schemas.common import BoardEnum
+
+# Single source of truth for attendance status input validation — matches
+# the Postgres enum `attendance_status` (app/models/enums.py::AttendanceStatus)
+# exactly. Used on every REQUEST schema that accepts a status so FastAPI
+# rejects an invalid value at the request-validation layer (422) instead of
+# letting it fall through to a raw IntegrityError from the DB enum (500).
+AttendanceStatusInput = Literal["present", "absent", "late", "excused"]
 
 
 class TimetableSlotCreate(BaseModel):
@@ -33,7 +40,7 @@ class TimetableSlotOut(BaseModel):
 
 class StudentAttendanceMarkItem(BaseModel):
     student_user_id: uuid.UUID
-    status: str  # present | absent | late | excused
+    status: AttendanceStatusInput
 
 
 class StudentAttendanceMarkRequest(BaseModel):
@@ -45,17 +52,23 @@ class StudentAttendanceMarkRequest(BaseModel):
 
 
 class TeacherAttendanceOverrideRequest(BaseModel):
-    """Coordinator manually marks/overrides a teacher's attendance for a period they never logged into."""
+    """Coordinator manually marks/overrides a teacher's attendance for a period they never logged into.
+
+    `reason` is optional (unlike AdminTeacherAttendanceMarkRequest.reason, which the router makes
+    mandatory on edits) — it's accepted here so an override still carries context into the audit
+    log and the teacher's notification when the caller provides one, without forcing every
+    first-time mark through the same friction as the Admin cascade screen."""
     timetable_slot_id: uuid.UUID
     subject_id: uuid.UUID
     teacher_user_id: uuid.UUID
     date: date
-    status: str
+    status: AttendanceStatusInput
+    reason: Optional[str] = None
 
 
 class TeacherDailyLogEntry(BaseModel):
     teacher_user_id: uuid.UUID
-    status: str  # present | absent | late | excused (UI's "Leave" maps to excused — see router note)
+    status: AttendanceStatusInput  # UI's "Leave" maps to excused — see router note
 
 
 class TeacherDailyLogRequest(BaseModel):
@@ -258,7 +271,7 @@ class AdminTeacherAttendanceMarkRequest(BaseModel):
     subject_id: uuid.UUID
     teacher_user_id: uuid.UUID
     date: date
-    status: str  # present | absent | late | excused
+    status: AttendanceStatusInput
     reason: Optional[str] = None
 
 

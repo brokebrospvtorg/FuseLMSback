@@ -23,10 +23,37 @@ router = APIRouter(prefix="/api/fees", tags=["fees"], dependencies=[Depends(chec
 
 
 def _latest_proof_for(db: Session, voucher_id: uuid.UUID) -> Optional[FeeProof]:
-    """No status column on fee_vouchers: derived from the latest non-deleted fee_proofs row."""
+    """No status column on fee_vouchers: derived from the latest non-deleted fee_proofs row.
+    Single-voucher lookup — used by the single-object endpoints below
+    (create_voucher, generate_fee_bill, download_fee_bill_pdf,
+    list_proofs_for_voucher/download_fee_proof_file's voucher check). For
+    a *list* of vouchers, use _latest_proofs_by_voucher instead — calling
+    this once per row there was an N+1 query (one extra round-trip per
+    voucher on every GET /vouchers)."""
     return db.query(FeeProof).filter(
         FeeProof.voucher_id == voucher_id, FeeProof.deleted_at.is_(None)
     ).order_by(FeeProof.uploaded_at.desc()).first()
+
+
+def _latest_proofs_by_voucher(db: Session, voucher_ids: List[uuid.UUID]) -> dict:
+    """Batch version of _latest_proof_for for GET /vouchers: one query for
+    every voucher_id in the page instead of one query per voucher. Fetches
+    every non-deleted proof for the given vouchers ordered newest-first,
+    then keeps only the first (= latest) one seen per voucher_id — same
+    'latest wins' semantics as the single-voucher version's .order_by(...).first().
+    """
+    if not voucher_ids:
+        return {}
+    rows = (
+        db.query(FeeProof)
+        .filter(FeeProof.voucher_id.in_(voucher_ids), FeeProof.deleted_at.is_(None))
+        .order_by(FeeProof.voucher_id, FeeProof.uploaded_at.desc())
+        .all()
+    )
+    latest_by_voucher: dict = {}
+    for proof in rows:
+        latest_by_voucher.setdefault(proof.voucher_id, proof)
+    return latest_by_voucher
 
 
 def _status_text_for(latest_proof: Optional[FeeProof]) -> str:
@@ -46,8 +73,20 @@ def _voucher_number(voucher: FeeVoucher) -> str:
     return f"INV-{voucher.generated_at.year}-{voucher.id.hex[:8].upper()}"
 
 
-def _voucher_out(db: Session, voucher: FeeVoucher, student_name: str) -> FeeVoucherOut:
-    latest_proof = _latest_proof_for(db, voucher.id)
+_UNSET = object()  # sentinel distinct from a real "no proof exists yet" None
+
+
+def _voucher_out(db: Session, voucher: FeeVoucher, student_name: str,
+                  latest_proof: Optional[FeeProof] = _UNSET) -> FeeVoucherOut:
+    """`latest_proof`: pass it in (even None, meaning 'confirmed no proof')
+    when the caller already resolved it via a batch query, to skip the
+    per-row lookup below. The sentinel default _UNSET (not None — None is
+    itself a valid, meaningful value here) means 'not supplied, look it up
+    the single-voucher way' — preserves the original behavior for every
+    other call site (create_voucher, generate_fee_bill) that only ever
+    builds one voucher at a time and has nothing to batch against."""
+    if latest_proof is _UNSET:
+        latest_proof = _latest_proof_for(db, voucher.id)
     return FeeVoucherOut(
         **{k: v for k, v in voucher.__dict__.items() if not k.startswith("_")},
         student_full_name=student_name,
@@ -123,7 +162,16 @@ def list_vouchers(student_id: Optional[uuid.UUID] = None,
         u.id: u.full_name
         for u in db.query(User).filter(User.id.in_(student_ids or [uuid.uuid4()])).all()
     }
-    return [_voucher_out(db, v, names_by_id.get(v.student_id, "Unknown")) for v in vouchers]
+    # Batch-loaded latest-proof-per-voucher (one query total) instead of
+    # _voucher_out's default per-voucher lookup — this endpoint is what the
+    # Pending Proofs review screen polls, so on a school with hundreds of
+    # vouchers this was hundreds of extra round-trips per page load.
+    latest_proofs_by_voucher = _latest_proofs_by_voucher(db, [v.id for v in vouchers])
+    return [
+        _voucher_out(db, v, names_by_id.get(v.student_id, "Unknown"),
+                     latest_proof=latest_proofs_by_voucher.get(v.id))
+        for v in vouchers
+    ]
 
 
 @router.post("/students/{student_id}/generate-bill", response_model=FeeVoucherOut, status_code=status.HTTP_201_CREATED)
@@ -425,6 +473,8 @@ def review_fee_proof(proof_id: uuid.UUID, payload: FeeProofReview, db: Session =
 # reusable default to pull from.
 # ---------------------------------------------------------------------------
 def _fee_structure_out(db: Session, fs: FeeStructure) -> FeeStructureOut:
+    """Single-row version — used by create/update, which only ever have
+    the one row they just wrote/changed, so there's nothing to batch."""
     subject = db.query(Subject).filter(Subject.id == fs.subject_id).first()
     student = db.query(User).filter(User.id == fs.student_id).first() if fs.student_id else None
     return FeeStructureOut(
@@ -434,6 +484,34 @@ def _fee_structure_out(db: Session, fs: FeeStructure) -> FeeStructureOut:
     )
 
 
+def _fee_structures_out_batch(db: Session, rows: List[FeeStructure]) -> List[FeeStructureOut]:
+    """List version — GET /structures was issuing 2 extra queries per row
+    (Subject lookup + optional User lookup), so a school with e.g. 40
+    subject defaults + overrides meant ~80 extra round-trips on every
+    Fee Structures page load. Batches both lookups into 2 queries total,
+    regardless of how many rows are returned."""
+    if not rows:
+        return []
+    subject_ids = {r.subject_id for r in rows}
+    student_ids = {r.student_id for r in rows if r.student_id}
+
+    subjects_by_id = {
+        s.id: s.name for s in db.query(Subject).filter(Subject.id.in_(subject_ids)).all()
+    } if subject_ids else {}
+    students_by_id = {
+        u.id: u.full_name for u in db.query(User).filter(User.id.in_(student_ids)).all()
+    } if student_ids else {}
+
+    return [
+        FeeStructureOut(
+            id=r.id, subject_id=r.subject_id, subject_name=subjects_by_id.get(r.subject_id),
+            student_id=r.student_id, student_name=students_by_id.get(r.student_id) if r.student_id else None,
+            amount=r.amount, set_by=r.set_by, created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+
 @router.get("/structures", response_model=List[FeeStructureOut])
 def list_fee_structures(subject_id: Optional[uuid.UUID] = None, db: Session = Depends(get_db),
                          current_user: User = Depends(require_roles("admin", "coordinator"))):
@@ -441,7 +519,7 @@ def list_fee_structures(subject_id: Optional[uuid.UUID] = None, db: Session = De
     if subject_id:
         query = query.filter(FeeStructure.subject_id == subject_id)
     rows = query.order_by(FeeStructure.created_at.desc()).all()
-    return [_fee_structure_out(db, r) for r in rows]
+    return _fee_structures_out_batch(db, rows)
 
 
 @router.post("/structures", response_model=FeeStructureOut, status_code=status.HTTP_201_CREATED)

@@ -326,7 +326,12 @@ def list_my_mark_edit_requests(
     # filters directly on MarkEditRequest.requested_by == current_user.id,
     # so a Coordinator only ever sees requests they themselves submitted
     # while acting as a Teacher, exactly the same as a real Teacher account.
-    current_user: User = Depends(require_roles("teacher", "coordinator")),
+    # RBAC fix: "admin" was missing here even though create_mark_edit_request
+    # (above) allows role in (teacher, admin, coordinator) to file one —
+    # an Admin who submitted a request had no endpoint to see it back.
+    # Same filter-by-requested_by scoping keeps this safe to add: an Admin
+    # only ever sees requests THEY personally filed, same as Teacher/Coordinator.
+    current_user: User = Depends(require_roles("teacher", "admin", "coordinator")),
 ):
     rows = _mark_edit_context_query(db).filter(
         MarkEditRequest.requested_by == current_user.id

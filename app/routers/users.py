@@ -106,6 +106,27 @@ _STUDENT_CODE_MAX_ATTEMPTS = 5
 _PARENT_REG_ID_PREFIX = "INK-P-"
 _PARENT_REG_ID_RE = re.compile(rf"^{_PARENT_REG_ID_PREFIX}(\d{{4,}})$")
 
+# ---------------------------------------------------------------------------
+# Parent Password — auto-generated initial credential, same shape as
+# Admin Teacher/Student Creation above.
+# ---------------------------------------------------------------------------
+# Unlike Teacher/Student, a Parent's initial_password is NOT forced —
+# an Admin/Coordinator filling out the Add Parent form can still set one
+# explicitly (payload.initial_password). This is only the fallback for
+# when they don't: previously, an omitted initial_password fell straight
+# into the generic `else` branch below with no forced value, leaving
+# password_hash NULL and silently routing the account through the
+# pending-activation-email path instead of being immediately usable.
+# A fixed, predictable value — same convention as DEFAULT_TEACHER_INITIAL_PASSWORD
+# / DEFAULT_STUDENT_INITIAL_PASSWORD / ADMIN_RESET_TEMP_PASSWORD
+# (password_requests.py) — rather than a per-account random secret, since
+# nothing in this app emails a generated password to the account owner;
+# a random value would be unrecoverable the moment this response returns.
+# must_change_password=True (forced below, same as every other branch)
+# is what keeps this safe to be predictable — it's a one-time handoff
+# value, never the account's standing password.
+DEFAULT_PARENT_INITIAL_PASSWORD = "Inkling@2026"
+
 
 def _next_roll_number(db: Session, year: int) -> str:
     """
@@ -263,13 +284,22 @@ def create_user(
 
     # Admin Teacher/Student Creation, point 3: a Teacher's or Student's
     # initial password is never the caller's choice — always the fixed
-    # default, always immediately active. Every other role keeps today's
-    # behaviour exactly (payload.initial_password when the caller set one,
-    # else the pending + activation-email path further below).
+    # default, always immediately active. Parent falls back to a fixed
+    # default only when the caller didn't set one (see DEFAULT_PARENT_
+    # INITIAL_PASSWORD above). Coordinator keeps today's behaviour exactly
+    # (payload.initial_password when the caller set one, else the pending
+    # + activation-email path further below).
     if payload.role == "teacher":
         effective_initial_password = DEFAULT_TEACHER_INITIAL_PASSWORD
     elif payload.role == "student":
         effective_initial_password = DEFAULT_STUDENT_INITIAL_PASSWORD
+    elif payload.role == "parent":
+        # Parent Password (fix): honor an explicit initial_password from
+        # the caller same as before, but auto-generate/store one instead
+        # of leaving password_hash NULL when none was sent — see
+        # DEFAULT_PARENT_INITIAL_PASSWORD above for why this is a fixed
+        # value rather than a random one.
+        effective_initial_password = payload.initial_password or DEFAULT_PARENT_INITIAL_PASSWORD
     else:
         effective_initial_password = payload.initial_password
 

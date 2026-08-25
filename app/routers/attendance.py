@@ -1,5 +1,5 @@
 import uuid
-from datetime import date as date_type, time
+from datetime import date as date_type, datetime, time, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -12,6 +12,7 @@ from app.core.dependencies import get_current_user, require_roles, check_license
 from app.core.offering_utils import active_boards_map
 from app.core.audit import log_action
 from app.core.notifications import notify
+from app.core.attendance_utils import upsert_attendance_record, try_auto_mark_present
 from app.models import AttendanceRecord, TimetableSlot, User, Subject, Enrollment, Level, Batch
 from app.schemas.attendance import (
     StudentAttendanceMarkRequest, TeacherAttendanceOverrideRequest, AttendanceRecordOut,
@@ -194,6 +195,15 @@ def mark_student_attendance(
     if not slot or slot.teacher_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your timetable slot")
 
+    # subject_id is derivable from the slot itself — don't trust the client's
+    # copy of it. A mismatch here would otherwise silently tag records to the
+    # wrong subject even though timetable_slot_id points somewhere else.
+    if payload.subject_id != slot.subject_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="subject_id does not match the subject assigned to this timetable slot.",
+        )
+
     # Strict current-date enforcement: a Teacher may only create or edit
     # attendance (this endpoint upserts, so it covers both) for today.
     # Past dates are read-only for the Teacher; corrections to past dates
@@ -205,50 +215,54 @@ def mark_student_attendance(
             detail="Teachers can only mark or edit attendance for the current date.",
         )
 
-    created: List[AttendanceRecord] = []
-    for item in payload.records:
-        existing = db.query(AttendanceRecord).filter(
-            AttendanceRecord.user_id == item.student_user_id,
-            AttendanceRecord.timetable_slot_id == payload.timetable_slot_id,
-            AttendanceRecord.date == payload.date,
-        ).first()
-        if existing:
-            existing.status = item.status
-            existing.marked_by = current_user.id
-            created.append(existing)
-        else:
-            record = AttendanceRecord(
-                user_id=item.student_user_id,
-                subject_id=payload.subject_id,
-                timetable_slot_id=payload.timetable_slot_id,
-                date=payload.date,
-                status=item.status,
-                marked_by=current_user.id,
-                source="manual",
-            )
-            db.add(record)
-            created.append(record)
+    # Every submitted student must be actively enrolled in this slot's
+    # subject/batch — otherwise a teacher could submit a status for an
+    # arbitrary user_id that was never on their roster to begin with.
+    enrolled_ids = {
+        row.student_id
+        for row in db.query(Enrollment.student_id).filter(
+            Enrollment.subject_id == payload.subject_id,
+            Enrollment.batch_id == slot.batch_id,
+            Enrollment.status == "active",
+            Enrollment.deleted_at.is_(None),
+        ).all()
+    }
+    not_enrolled = [
+        str(item.student_user_id) for item in payload.records
+        if item.student_user_id not in enrolled_ids
+    ]
+    if not_enrolled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Student(s) not actively enrolled in this subject/batch: {', '.join(not_enrolled)}",
+        )
 
-    # Auto-mark the teacher present for this period, if not already recorded.
-    teacher_record = db.query(AttendanceRecord).filter(
-        AttendanceRecord.user_id == current_user.id,
-        AttendanceRecord.timetable_slot_id == payload.timetable_slot_id,
-        AttendanceRecord.date == payload.date,
-    ).first()
-    if not teacher_record:
-        db.add(AttendanceRecord(
-            user_id=current_user.id,
+    created = []
+    for item in payload.records:
+        row = upsert_attendance_record(
+            db,
+            user_id=item.student_user_id,
             subject_id=payload.subject_id,
             timetable_slot_id=payload.timetable_slot_id,
             date=payload.date,
-            status="present",
+            status=item.status,
             marked_by=current_user.id,
-            source="auto",
-        ))
+            source="manual",
+        )
+        created.append(row)
+
+    # Auto-mark the teacher present for this period, if not already recorded.
+    # ON CONFLICT DO NOTHING — never overwrites a status already present.
+    try_auto_mark_present(
+        db,
+        user_id=current_user.id,
+        subject_id=payload.subject_id,
+        timetable_slot_id=payload.timetable_slot_id,
+        date=payload.date,
+        marked_by=current_user.id,
+    )
 
     db.commit()
-    for r in created:
-        db.refresh(r)
     return created
 
 
@@ -476,33 +490,29 @@ def coordinator_override_student_attendance(
     if not slot:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Timetable slot not found")
 
-    saved: List[AttendanceRecord] = []
+    # subject_id is derivable from the slot itself — don't trust the client's
+    # copy of it, same rule as POST /mark-students.
+    if payload.subject_id != slot.subject_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="subject_id does not match the subject assigned to this timetable slot.",
+        )
+
+    saved = []
     for item in payload.records:
-        existing = db.query(AttendanceRecord).filter(
-            AttendanceRecord.user_id == item.student_user_id,
-            AttendanceRecord.timetable_slot_id == payload.timetable_slot_id,
-            AttendanceRecord.date == payload.date,
-        ).first()
-        if existing:
-            existing.status = item.status
-            existing.marked_by = current_user.id
-            saved.append(existing)
-        else:
-            record = AttendanceRecord(
-                user_id=item.student_user_id,
-                subject_id=payload.subject_id,
-                timetable_slot_id=payload.timetable_slot_id,
-                date=payload.date,
-                status=item.status,
-                marked_by=current_user.id,
-                source="manual",
-            )
-            db.add(record)
-            saved.append(record)
+        row = upsert_attendance_record(
+            db,
+            user_id=item.student_user_id,
+            subject_id=payload.subject_id,
+            timetable_slot_id=payload.timetable_slot_id,
+            date=payload.date,
+            status=item.status,
+            marked_by=current_user.id,
+            source="manual",
+        )
+        saved.append(row)
 
     db.commit()
-    for r in saved:
-        db.refresh(r)
     return saved
 
 
@@ -512,29 +522,77 @@ def coordinator_mark_or_override_teacher(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("coordinator", "admin")),
 ):
-    """Coordinator manually marks (absent/late/excused) or overrides a teacher's attendance for a period."""
-    record = db.query(AttendanceRecord).filter(
+    """
+    Coordinator/Admin manually marks (absent/late/excused) or overrides a teacher's
+    attendance for a period. Mirrors POST /admin/teacher-attendance's integrity and
+    accountability guarantees: the slot must exist and not be soft-deleted, the
+    teacher must actually be the one assigned to it, and any change is written to
+    the audit_logs trail (log_action) plus, on an override of an existing status,
+    surfaced to the teacher via notify() — exactly like /admin/teacher-attendance
+    does, so the two endpoints no longer diverge on accountability for the same
+    conceptual action.
+    """
+    slot = db.query(TimetableSlot).filter(
+        TimetableSlot.id == payload.timetable_slot_id, TimetableSlot.deleted_at.is_(None)
+    ).first()
+    if not slot:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Timetable slot not found")
+    if slot.teacher_id != payload.teacher_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="teacher_user_id does not match the teacher assigned to this timetable slot.",
+        )
+    if payload.subject_id != slot.subject_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="subject_id does not match the subject assigned to this timetable slot.",
+        )
+
+    # A lightweight pre-check to decide the audit action / old_value / whether
+    # this counts as an override for notification purposes. The actual write
+    # below is still a single atomic upsert — this SELECT deciding "is this a
+    # first mark or an override" can theoretically race against a second
+    # concurrent request the same way it always could, but that only risks
+    # mislabeling an audit action, never a duplicate row: the DB-level
+    # uniqueness constraint + ON CONFLICT guarantee data integrity regardless
+    # of what this pre-check believed.
+    existing = db.query(AttendanceRecord).filter(
         AttendanceRecord.user_id == payload.teacher_user_id,
         AttendanceRecord.timetable_slot_id == payload.timetable_slot_id,
         AttendanceRecord.date == payload.date,
     ).first()
-    if record:
-        record.status = payload.status
-        record.marked_by = current_user.id
-        record.source = "manual"
-    else:
-        record = AttendanceRecord(
-            user_id=payload.teacher_user_id,
-            subject_id=payload.subject_id,
-            timetable_slot_id=payload.timetable_slot_id,
-            date=payload.date,
-            status=payload.status,
-            marked_by=current_user.id,
-            source="manual",
-        )
-        db.add(record)
+    old_value = {"status": existing.status, "source": existing.source} if existing else None
+    action = "teacher_attendance_overridden" if existing else "teacher_attendance_marked"
+
+    record = upsert_attendance_record(
+        db,
+        user_id=payload.teacher_user_id,
+        subject_id=payload.subject_id,
+        timetable_slot_id=payload.timetable_slot_id,
+        date=payload.date,
+        status=payload.status,
+        marked_by=current_user.id,
+        source="manual",
+    )
+
+    log_action(
+        db, current_user.id, action, "attendance_records", record.id, old_value,
+        {"status": payload.status, "reason": payload.reason},
+    )
+
+    if action == "teacher_attendance_overridden":
+        teacher = db.query(User).filter(User.id == payload.teacher_user_id).first()
+        if teacher:
+            reason_suffix = f": {payload.reason}" if payload.reason else ""
+            actor_label = current_user.role.capitalize() if current_user.role else "Coordinator"
+            notify(
+                db, teacher.id, "teacher_attendance_overridden",
+                f"Your attendance for {payload.date.isoformat()} was changed to "
+                f"'{payload.status}' by a {actor_label}{reason_suffix}.",
+                related_entity_type="attendance_records", related_entity_id=record.id,
+            )
+
     db.commit()
-    db.refresh(record)
     return record
 
 
@@ -675,13 +733,19 @@ def mark_or_override_admin_teacher_attendance(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="teacher_user_id does not match the teacher assigned to this timetable slot.",
         )
-
-    valid_statuses = {"present", "absent", "late", "excused"}
-    if payload.status not in valid_statuses:
+    if payload.subject_id != slot.subject_id:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid status '{payload.status}'"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="subject_id does not match the subject assigned to this timetable slot.",
         )
 
+    # A lightweight pre-check: still needed here (unlike the write itself)
+    # because the mandatory-reason-on-edit business rule has to be decided
+    # — and enforced with a 400, doing nothing — before any DB mutation
+    # happens at all. The actual write further down is still a single
+    # atomic upsert; this SELECT only decides "is a reason required" and
+    # what old_value to log, the same limited race noted in
+    # POST /teacher-override above (mislabeling only, never a duplicate row).
     record = db.query(AttendanceRecord).filter(
         AttendanceRecord.user_id == payload.teacher_user_id,
         AttendanceRecord.timetable_slot_id == payload.timetable_slot_id,
@@ -696,25 +760,22 @@ def mark_or_override_admin_teacher_attendance(
                 detail="A reason is required when editing or overriding an existing attendance record.",
             )
         old_value = {"status": record.status, "source": record.source}
-        record.status = payload.status
-        record.marked_by = current_user.id
-        record.source = "manual"
         action = "teacher_attendance_overridden"
     else:
         old_value = None
-        record = AttendanceRecord(
-            user_id=payload.teacher_user_id,
-            subject_id=payload.subject_id,
-            timetable_slot_id=payload.timetable_slot_id,
-            date=payload.date,
-            status=payload.status,
-            marked_by=current_user.id,
-            source="manual",
-        )
-        db.add(record)
         action = "teacher_attendance_marked"
 
-    db.flush()  # populate record.id (server_default) before logging/notifying it
+    record = upsert_attendance_record(
+        db,
+        user_id=payload.teacher_user_id,
+        subject_id=payload.subject_id,
+        timetable_slot_id=payload.timetable_slot_id,
+        date=payload.date,
+        status=payload.status,
+        marked_by=current_user.id,
+        source="manual",
+    )
+
     log_action(
         db, current_user.id, action, "attendance_records", record.id, old_value,
         {"status": payload.status, "reason": payload.reason},
@@ -724,15 +785,15 @@ def mark_or_override_admin_teacher_attendance(
         teacher = db.query(User).filter(User.id == payload.teacher_user_id).first()
         if teacher:
             reason_suffix = f": {payload.reason}" if payload.reason else ""
+            actor_label = current_user.role.capitalize() if current_user.role else "Admin"
             notify(
                 db, teacher.id, "teacher_attendance_overridden",
                 f"Your attendance for {payload.date.isoformat()} was changed to "
-                f"'{payload.status}' by an Admin{reason_suffix}.",
+                f"'{payload.status}' by an {actor_label}{reason_suffix}.",
                 related_entity_type="attendance_records", related_entity_id=record.id,
             )
 
     db.commit()
-    db.refresh(record)
     return record
 
 
@@ -806,20 +867,17 @@ def save_teacher_daily_log(
     that day can't get an attendance_records row — timetable_slot_id and
     subject_id are both NOT NULL on that table — so those are reported back
     in `skipped` rather than silently dropped or erroring the whole batch.
+
+    entry.status is a Pydantic Literal (AttendanceStatusInput) on
+    TeacherDailyLogEntry, so an invalid status is already rejected with a
+    422 at request validation — no manual check needed per-entry here.
     """
-    valid_statuses = {"present", "absent", "late", "excused"}
     day_name = payload.date.strftime("%A").lower()
 
     updated_ids: List[uuid.UUID] = []
     skipped: List[TeacherDailyLogSkipped] = []
 
     for entry in payload.entries:
-        if entry.status not in valid_statuses:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid status '{entry.status}' for teacher {entry.teacher_user_id}",
-            )
-
         slots = db.query(TimetableSlot).filter(
             TimetableSlot.teacher_id == entry.teacher_user_id, TimetableSlot.day_of_week == day_name,
             TimetableSlot.deleted_at.is_(None),
@@ -832,21 +890,16 @@ def save_teacher_daily_log(
             continue
 
         for slot in slots:
-            record = db.query(AttendanceRecord).filter(
-                AttendanceRecord.user_id == entry.teacher_user_id,
-                AttendanceRecord.timetable_slot_id == slot.id,
-                AttendanceRecord.date == payload.date,
-            ).first()
-            if record:
-                record.status = entry.status
-                record.marked_by = current_user.id
-                record.source = "manual"
-            else:
-                db.add(AttendanceRecord(
-                    user_id=entry.teacher_user_id, subject_id=slot.subject_id,
-                    timetable_slot_id=slot.id, date=payload.date,
-                    status=entry.status, marked_by=current_user.id, source="manual",
-                ))
+            upsert_attendance_record(
+                db,
+                user_id=entry.teacher_user_id,
+                subject_id=slot.subject_id,
+                timetable_slot_id=slot.id,
+                date=payload.date,
+                status=entry.status,
+                marked_by=current_user.id,
+                source="manual",
+            )
         updated_ids.append(entry.teacher_user_id)
 
     db.commit()
@@ -936,3 +989,91 @@ def list_attendance(
         )
         for record, subject_name in rows
     ]
+
+
+@router.delete("/records/{record_id}", status_code=status.HTTP_204_NO_CONTENT)
+def void_attendance_record(
+    record_id: uuid.UUID,
+    reason: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "coordinator")),
+):
+    """
+    Soft-delete / void a single attendance_records row — the "official
+    retraction" path for a record that should never have counted at all
+    (duplicate from a bug, wrong student entirely, wrong period, etc.).
+    This is distinct from every /override, /teacher-override, and
+    /admin/teacher-attendance endpoint above: those CORRECT a record's
+    status in place and it still counts; this removes it from every read
+    path in this router (every GET here already filters
+    AttendanceRecord.deleted_at.is_(None)) and therefore from
+    AttendanceSummaryOut totals, coordinator/admin day-wise counts, and
+    the roster/history views, without destroying the row — the original
+    status/source/marked_by/marked_at survive on the row itself, and the
+    full old_value is written to audit_logs, for anyone who needs to see
+    what a retracted record used to say.
+
+    Scoped to Admin/Coordinator, same as every other correction endpoint
+    in this file. A Teacher who marked something wrong today should
+    just resubmit via POST /mark-students (an upsert — it overwrites the
+    status in place); void is for retracting a record outside that
+    same-day self-service window, or one a Teacher never marked at all.
+
+    `reason` is mandatory — same accountability rule as an edit in
+    POST /admin/teacher-attendance (retracting a record is at least as
+    consequential as changing its status). It's a query param rather
+    than a request body: this codebase's convention is that DELETE
+    endpoints carry no body (see /content/materials/{id},
+    /marks/{mark_id}, /subjects/{id}, /timetable/slots/{id}, etc.), and
+    reason is the one extra piece of accountability data a void needs
+    that those simpler deletes don't.
+
+    Re-marking after a void: the (user_id, timetable_slot_id, date)
+    unique constraint is keyed on identity, not on deleted_at, so a
+    voided row is still the ON CONFLICT target if that same person is
+    re-marked for that same period+date later. upsert_attendance_record()
+    clears deleted_at on that path (see its docstring) specifically so a
+    re-mark after a void correctly revives the row instead of leaving it
+    permanently hidden behind what would otherwise look like a live,
+    current status.
+    """
+    if not reason or not reason.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A reason is required to void an attendance record.",
+        )
+
+    record = db.query(AttendanceRecord).filter(
+        AttendanceRecord.id == record_id, AttendanceRecord.deleted_at.is_(None),
+    ).first()
+    if not record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attendance record not found")
+
+    old_value = {
+        "user_id": str(record.user_id),
+        "subject_id": str(record.subject_id),
+        "timetable_slot_id": str(record.timetable_slot_id),
+        "date": record.date.isoformat(),
+        "status": record.status,
+        "source": record.source,
+        "marked_by": str(record.marked_by),
+    }
+    record.deleted_at = datetime.now(timezone.utc)
+
+    log_action(
+        db, current_user.id, "attendance_record_voided", "attendance_records", record.id,
+        old_value, {"reason": reason},
+    )
+
+    affected_user = db.query(User).filter(User.id == record.user_id).first()
+    if affected_user:
+        actor_label = current_user.role.capitalize() if current_user.role else "Coordinator"
+        notify(
+            db, affected_user.id, "attendance_record_voided",
+            f"Your '{record.status}' attendance record for {record.date.isoformat()} "
+            f"was voided by a {actor_label}: {reason}",
+            related_entity_type="attendance_records", related_entity_id=record.id,
+        )
+
+    db.commit()
+    return None

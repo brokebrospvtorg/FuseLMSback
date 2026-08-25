@@ -159,7 +159,18 @@ def child_report_card(student_id: uuid.UUID, db: Session = Depends(get_db),
             subject_name=subject_name,
             computed_percentage=float(grade.computed_percentage) if grade.computed_percentage is not None else None,
             letter_grade=grade.letter_grade,
-            is_overridden=grade.is_overridden,
+            # Mark Override refactor (schema_update_18): Grade itself no
+            # longer carries an is_overridden column — correction now
+            # happens per-Mark (Mark.is_overridden/overridden_by, set by
+            # PATCH /api/academics/marks/{id}/mark-override) and every
+            # override recomputes this Grade row's percentage/letter_grade,
+            # but doesn't leave a flag on Grade itself. `grade.is_overridden`
+            # here was stale post-refactor and raised an AttributeError on
+            # every call (500). True if ANY of this subject's published
+            # marks the parent can see was corrected — a Parent (unlike a
+            # Student, see student_grades.py's my_grade_report) is meant to
+            # see this override signal.
+            is_overridden=any(mark.is_overridden for mark, _, _ in mark_rows),
             assessments=[
                 ParentMarkEntryOut(
                     assessment_id=mark.assessment_id,

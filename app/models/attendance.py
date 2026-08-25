@@ -1,4 +1,4 @@
-from sqlalchemy import Column, ForeignKey, TIMESTAMP, Date, Time, text
+from sqlalchemy import Column, ForeignKey, TIMESTAMP, Date, Time, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.core.database import Base
@@ -22,6 +22,19 @@ class TimetableSlot(Base):
 
 class AttendanceRecord(Base):
     __tablename__ = "attendance_records"
+    __table_args__ = (
+        # One row per (person, period, day) — the same key every write path
+        # already keys its select-then-insert/update lookups on. Enforcing
+        # it in Postgres (not just in application logic) closes the race
+        # where two near-simultaneous submits for the same student/teacher
+        # + timetable_slot_id + date both see "no existing row" and both
+        # INSERT, producing duplicates. Write paths now upsert against this
+        # exact constraint via ON CONFLICT (see app/core/attendance_utils.py).
+        UniqueConstraint(
+            "user_id", "timetable_slot_id", "date",
+            name="uq_attendance_records_user_slot_date",
+        ),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
