@@ -5,6 +5,8 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from app.schemas.common import ApprovalStatus
+
 
 class FeeVoucherCreate(BaseModel):
     student_id: uuid.UUID
@@ -36,7 +38,7 @@ class FeeVoucherOut(BaseModel):
 
 
 class FeeProofReview(BaseModel):
-    status: str  # approved | rejected
+    status: ApprovalStatus
     rejection_reason: Optional[str] = None
 
 

@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from app.core.batch_utils import (
     BATCH_SESSIONS, DEFAULT_YEARS_AHEAD, batch_date_range, format_batch_name,
 )
-from app.schemas.common import BoardEnum
+from app.schemas.common import ApprovalStatus, BatchSession, BoardEnum
 
 
 class BatchCreate(BaseModel):
@@ -26,7 +26,7 @@ class BatchCreate(BaseModel):
     (kept as explicit fields, rather than dropped, since BatchOut/the ORM
     still need them and some callers pass them through unchanged).
     """
-    session: str  # may_june | oct_nov
+    session: BatchSession
     year: int
     name: Optional[str] = None
     start_date: Optional[date] = None
@@ -247,7 +247,7 @@ class SubjectRequestCreate(BaseModel):
 
 
 class SubjectRequestReview(BaseModel):
-    status: str  # approved | rejected
+    status: ApprovalStatus
     # Optional — not persisted as its own column (no migration for this sub-sprint),
     # but folded into the audit log's new_value and the student's notification message.
     comment: Optional[str] = None

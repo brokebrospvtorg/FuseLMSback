@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.dependencies import get_current_user, require_roles, check_license
+from app.core.dependencies import get_current_user, require_roles, check_license, require_teacher_assigned
 from app.core.audit import log_action
 from app.core.notifications import notify
 from app.core.grading import calculate_percentage, calculate_grade
@@ -29,6 +29,10 @@ router = APIRouter(prefix="/api/academics", tags=["marks-grades"], dependencies=
 @router.post("/assessments", response_model=AssessmentOut, status_code=status.HTTP_201_CREATED)
 def create_assessment(payload: AssessmentCreate, db: Session = Depends(get_db),
                        current_user: User = Depends(require_roles("teacher", "admin", "coordinator"))):
+    # BOLA/IDOR fix: subject_id/batch_id are supplied in the body, so the
+    # assignment check is invoked directly here rather than via Depends.
+    require_teacher_assigned(subject_id=payload.subject_id, batch_id=payload.batch_id,
+                              db=db, current_user=current_user)
     assessment = Assessment(**payload.model_dump(), created_by=current_user.id)
     db.add(assessment)
     db.commit()
@@ -55,6 +59,12 @@ def publish_assessment(assessment_id: uuid.UUID, db: Session = Depends(get_db),
     ).first()
     if not assessment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment not found")
+
+    # BOLA/IDOR fix: subject_id/batch_id only exist on the fetched Assessment
+    # row (assessment_id is the only path parameter), so they're extracted
+    # here and passed into the assignment check before the publish proceeds.
+    require_teacher_assigned(subject_id=assessment.subject_id, batch_id=assessment.batch_id,
+                              db=db, current_user=current_user)
 
     assessment.status = "published"
     db.commit()
@@ -145,7 +155,11 @@ def delete_assessment(assessment_id: uuid.UUID, db: Session = Depends(get_db),
 # ---------------------------------------------------------------------------
 @router.get("/roster", response_model=List[RosterEntryOut])
 def get_roster(subject_id: uuid.UUID, batch_id: uuid.UUID, db: Session = Depends(get_db),
-                current_user: User = Depends(require_roles("teacher", "coordinator", "admin"))):
+                current_user: User = Depends(require_roles("teacher", "coordinator", "admin")),
+                # BOLA/IDOR fix: subject_id/batch_id are already query
+                # parameters on this route, so FastAPI binds this
+                # dependency's same-named parameters from the request too.
+                _assigned: User = Depends(require_teacher_assigned)):
     rows = (
         db.query(User.id, User.full_name, StudentProfile.roll_number)
         .join(Enrollment, Enrollment.student_id == User.id)
@@ -174,6 +188,11 @@ def upsert_marks(assessment_id: uuid.UUID, payload: List[MarkUpsert], db: Sessio
     ).first()
     if not assessment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment not found")
+
+    # BOLA/IDOR fix: same extraction pattern as publish_assessment above —
+    # subject_id/batch_id come from the fetched Assessment, not the path.
+    require_teacher_assigned(subject_id=assessment.subject_id, batch_id=assessment.batch_id,
+                              db=db, current_user=current_user)
 
     results = []
     for item in payload:

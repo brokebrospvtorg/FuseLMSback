@@ -2,11 +2,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_roles, check_license
+from app.core.limiter import limiter
 from app.core.notifications import notify
 from app.models import Notification, User
 from app.schemas.communication import NotificationOut
@@ -42,7 +43,8 @@ def mark_read(notification_id: uuid.UUID, db: Session = Depends(get_db),
 
 
 @router.post("/broadcast", response_model=BroadcastResult, status_code=status.HTTP_201_CREATED)
-def broadcast_notification(payload: BroadcastNotificationCreate, db: Session = Depends(get_db),
+@limiter.limit("2/minute")
+def broadcast_notification(request: Request, payload: BroadcastNotificationCreate, db: Session = Depends(get_db),
                             current_user: User = Depends(require_roles("admin"))):
     """
     Admin Sub-Sprint 4: "Broadcast system notifications and fee alerts."

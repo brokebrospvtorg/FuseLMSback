@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 from typing import Optional, List, Literal
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
-from app.schemas.common import BoardEnum, GenderEnum, ReligionEnum, NationalityEnum
+from app.schemas.common import BoardEnum, GenderEnum, ReligionEnum, NationalityEnum, UserStatus, validate_password_strength
 
 
 class UserCreate(BaseModel):
@@ -36,6 +36,17 @@ class UserCreate(BaseModel):
     subject_ids: Optional[List[uuid.UUID]] = None
     initial_password: Optional[str] = Field(default=None, min_length=8)
 
+    @field_validator("initial_password")
+    @classmethod
+    def _validate_initial_password(cls, v: Optional[str]) -> Optional[str]:
+        # Optional: a caller (Admin/Coordinator) may omit it entirely and
+        # let the forced-default/onboarding flow apply instead — see
+        # users.py's effective_initial_password branch. Only validate
+        # complexity when a value was actually supplied.
+        if v is None:
+            return v
+        return validate_password_strength(v)
+
     @field_validator("level_ids")
     @classmethod
     def _dedupe_level_ids(cls, v: Optional[List[uuid.UUID]]) -> Optional[List[uuid.UUID]]:
@@ -59,7 +70,7 @@ class UserCreate(BaseModel):
 
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
-    status: Optional[str] = None
+    status: Optional[UserStatus] = None
     role: Optional[Literal["coordinator", "teacher", "student", "parent"]] = None
     phone_number: Optional[str] = Field(
         default=None, pattern=r"^(\+92|0)3\d{9}$",
@@ -225,3 +236,8 @@ class MyProfileOut(BaseModel):
 
 class AdminResetPasswordRequest(BaseModel):
     new_password: str = Field(min_length=8)
+
+    @field_validator("new_password")
+    @classmethod
+    def _validate_new_password(cls, v: str) -> str:
+        return validate_password_strength(v)

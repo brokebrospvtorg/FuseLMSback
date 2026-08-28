@@ -2,11 +2,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_roles, check_license
+from app.core.limiter import limiter
 from app.core.notifications import notify
 from app.models import Complaint, ParentStudentLink, User
 from app.schemas.communication import ComplaintCreate, ComplaintUpdate, ComplaintOut
@@ -43,7 +44,9 @@ def _complaint_out(db: Session, complaint: Complaint) -> ComplaintOut:
 
 
 @router.post("", response_model=ComplaintOut, status_code=status.HTTP_201_CREATED)
+@limiter.limit("5/minute")
 def submit_complaint(
+    request: Request,
     payload: ComplaintCreate, db: Session = Depends(get_db),
     # S3.3 backend fix: also admits a Coordinator with a dual Teacher
     # assignment (see RoleSwitchService/teacherPortalGuard on the

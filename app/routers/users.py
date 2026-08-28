@@ -44,10 +44,9 @@ router = APIRouter(prefix="/api/users", tags=["users"], dependencies=[Depends(ch
 #      active — same "skip the activation email" branch the general
 #      initial_password mechanism already provides, just forced for every
 #      Teacher rather than left to whatever the caller sent.
-# Both are deliberately hardcoded constants, not settings.* — they're a
-# fixed onboarding convention (spec-mandated format/value), not
-# environment-specific configuration.
-DEFAULT_TEACHER_INITIAL_PASSWORD = "Inkling@2026"
+# Sourced from Settings (app/core/config.py -> DEFAULT_TEACHER_INITIAL_PASSWORD
+# env var) rather than hardcoded, so it isn't a fixed value sitting in
+# source control and can differ per deployment.
 _TEACHER_CODE_PREFIX = "INK-T-"
 _TEACHER_CODE_RE = re.compile(rf"^{_TEACHER_CODE_PREFIX}(\d{{4,}})$")
 _TEACHER_CODE_MAX_ATTEMPTS = 5
@@ -98,7 +97,8 @@ def _next_teacher_code(db: Session) -> str:
 #      shape for a roll number.
 #   2. A fixed starting password + must_change_password=True, immediately
 #      active — same forced-default branch as Admin Teacher Creation.
-DEFAULT_STUDENT_INITIAL_PASSWORD = "Inkling@2026"
+# Sourced from Settings (DEFAULT_STUDENT_INITIAL_PASSWORD env var) — see
+# note above DEFAULT_TEACHER_INITIAL_PASSWORD's usage.
 _ROLL_NUMBER_PREFIX = "INK-"
 _STUDENT_CODE_MAX_ATTEMPTS = 5
 
@@ -125,7 +125,8 @@ _PARENT_REG_ID_RE = re.compile(rf"^{_PARENT_REG_ID_PREFIX}(\d{{4,}})$")
 # must_change_password=True (forced below, same as every other branch)
 # is what keeps this safe to be predictable — it's a one-time handoff
 # value, never the account's standing password.
-DEFAULT_PARENT_INITIAL_PASSWORD = "Inkling@2026"
+# Sourced from Settings (DEFAULT_PARENT_INITIAL_PASSWORD env var) — see
+# note above DEFAULT_TEACHER_INITIAL_PASSWORD's usage.
 
 
 def _next_roll_number(db: Session, year: int) -> str:
@@ -290,16 +291,16 @@ def create_user(
     # (payload.initial_password when the caller set one, else the pending
     # + activation-email path further below).
     if payload.role == "teacher":
-        effective_initial_password = DEFAULT_TEACHER_INITIAL_PASSWORD
+        effective_initial_password = settings.DEFAULT_TEACHER_INITIAL_PASSWORD
     elif payload.role == "student":
-        effective_initial_password = DEFAULT_STUDENT_INITIAL_PASSWORD
+        effective_initial_password = settings.DEFAULT_STUDENT_INITIAL_PASSWORD
     elif payload.role == "parent":
         # Parent Password (fix): honor an explicit initial_password from
         # the caller same as before, but auto-generate/store one instead
         # of leaving password_hash NULL when none was sent — see
         # DEFAULT_PARENT_INITIAL_PASSWORD above for why this is a fixed
         # value rather than a random one.
-        effective_initial_password = payload.initial_password or DEFAULT_PARENT_INITIAL_PASSWORD
+        effective_initial_password = payload.initial_password or settings.DEFAULT_PARENT_INITIAL_PASSWORD
     else:
         effective_initial_password = payload.initial_password
 

@@ -2,12 +2,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.dependencies import get_current_user, require_roles, check_license
+from app.core.dependencies import get_current_user, require_roles, check_license, require_teacher_assigned
 from app.core.audit import log_action
+from app.core.limiter import limiter
 from app.core.notifications import notify
 from app.utils.youtube import parse_youtube_video_id
 from app.models import (
@@ -56,8 +57,13 @@ def _student_has_subject_access(db: Session, student_id: uuid.UUID, subject_id: 
 # Helping materials (subject-scoped, not batch-scoped, reusable across years)
 # ---------------------------------------------------------------------------
 @router.post("/materials", response_model=HelpingMaterialOut, status_code=status.HTTP_201_CREATED)
-def upload_material(payload: HelpingMaterialCreate, db: Session = Depends(get_db),
+@limiter.limit("10/minute")
+def upload_material(request: Request, payload: HelpingMaterialCreate, db: Session = Depends(get_db),
                      current_user: User = Depends(require_roles("teacher", "admin", "coordinator"))):
+    # BOLA/IDOR fix: HelpingMaterialCreate only carries subject_id (no
+    # batch_id — materials are subject-scoped, reusable across batches),
+    # so the check runs on subject_id alone (assigned in ANY batch).
+    require_teacher_assigned(subject_id=payload.subject_id, db=db, current_user=current_user)
     material = HelpingMaterial(**payload.model_dump(), uploaded_by=current_user.id)
     db.add(material)
     db.commit()
@@ -125,6 +131,15 @@ def replace_material(material_id: uuid.UUID, db: Session = Depends(get_db),
     ).first()
     if not material:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Material not found")
+
+    # BOLA/IDOR fix: role alone let any Teacher delete any Teacher's
+    # material by guessing/enumerating material_id. Admin/Coordinator keep
+    # full access (they can already fully manage content); a Teacher may
+    # only delete material they themselves uploaded.
+    if current_user.role == "teacher" and material.uploaded_by != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                             detail="You can only delete material you uploaded")
+
     material.deleted_at = datetime.now(timezone.utc)
     db.commit()
     return None
@@ -134,7 +149,8 @@ def replace_material(material_id: uuid.UUID, db: Session = Depends(get_db),
 # Lectures (YouTube unlisted; same batch-independent access rule)
 # ---------------------------------------------------------------------------
 @router.post("/lectures", response_model=LectureOut, status_code=status.HTTP_201_CREATED)
-def upload_lecture(payload: LectureCreate, db: Session = Depends(get_db),
+@limiter.limit("10/minute")
+def upload_lecture(request: Request, payload: LectureCreate, db: Session = Depends(get_db),
                     current_user: User = Depends(require_roles("teacher", "admin", "coordinator"))):
     """
     LMS & Study Resources refactor: Title, Description, and YouTube Video
@@ -145,6 +161,11 @@ def upload_lecture(payload: LectureCreate, db: Session = Depends(get_db),
     below) — a bad/unrecognized YouTube link still 400s before any row is
     written, same defend-at-the-boundary approach as before.
     """
+    # BOLA/IDOR fix: LectureCreate only carries subject_id (no batch_id —
+    # same subject-scoped, reusable-across-batches design as materials),
+    # so the check runs on subject_id alone (assigned in ANY batch).
+    require_teacher_assigned(subject_id=payload.subject_id, db=db, current_user=current_user)
+
     video_id = parse_youtube_video_id(payload.youtube_url)
     if not video_id:
         raise HTTPException(

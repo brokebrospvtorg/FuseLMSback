@@ -34,6 +34,11 @@ from app.core.audit import log_action
 from app.models import (
     Subject, SubjectLevel, Level, BatchSubject, Enrollment,
     TeacherSubjectAssignment, SubjectRequest, User,
+    Assessment, Mark, MarkEditRequest, Grade,
+    AttendanceRecord, TimetableSlot,
+    Lecture, ClassroomEditRequest, YoutubeEditRequest,
+    HelpingMaterial, SubjectClassroomLink,
+    FeeStructure,
 )
 from app.schemas.academic import SubjectOut, SubjectUpdate, SubjectStatusUpdate
 
@@ -151,77 +156,159 @@ def set_subject_status(
     return _serialize(db, subject)
 
 
+def _purge_subject_dependents(db: Session, subject_id: uuid.UUID) -> dict:
+    """
+    Hard-delete every row across the schema that references this subject,
+    deepest children first, so the FK graph is clear before Subject itself
+    is deleted. Runs inside the caller's transaction (no commit here) so
+    the whole purge + the Subject delete succeed or fail together.
+
+    Order matters — a child must be gone before its own parent-of-a-parent
+    is removed, or Postgres will raise a FK violation:
+
+      marks/mark_edit_requests -> assessments -> subjects
+      attendance_records -> timetable_slots -> subjects
+                          (attendance_records also FKs subjects directly)
+      classroom_edit_requests/youtube_edit_requests -> lectures -> subjects
+      helping_materials, subject_classroom_links -> subjects
+      fee_structures -> subjects
+      teacher_subject_assignments, enrollments, subject_requests,
+      batch_subjects, subject_levels -> subjects
+
+    Returns a per-table row count, written into the audit log so a hard
+    delete like this still leaves a trail of exactly what it took with it.
+    """
+    purged: dict = {}
+
+    # Marks & assessments
+    mark_ids = [
+        row.id for row in
+        db.query(Mark.id)
+        .join(Assessment, Assessment.id == Mark.assessment_id)
+        .filter(Assessment.subject_id == subject_id)
+        .all()
+    ]
+    purged["mark_edit_requests"] = (
+        db.query(MarkEditRequest).filter(MarkEditRequest.mark_id.in_(mark_ids))
+        .delete(synchronize_session=False) if mark_ids else 0
+    )
+    purged["marks"] = (
+        db.query(Mark).filter(Mark.id.in_(mark_ids))
+        .delete(synchronize_session=False) if mark_ids else 0
+    )
+    purged["assessments"] = (
+        db.query(Assessment).filter(Assessment.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+    purged["grades"] = (
+        db.query(Grade).filter(Grade.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+
+    # Attendance & timetable (attendance_records FK both subjects and
+    # timetable_slots, so it must go before timetable_slots is deleted)
+    purged["attendance_records"] = (
+        db.query(AttendanceRecord).filter(AttendanceRecord.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+    purged["timetable_slots"] = (
+        db.query(TimetableSlot).filter(TimetableSlot.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+
+    # Content: lectures, helping materials, classroom link
+    lecture_ids = [
+        row.id for row in db.query(Lecture.id).filter(Lecture.subject_id == subject_id).all()
+    ]
+    purged["classroom_edit_requests"] = (
+        db.query(ClassroomEditRequest).filter(ClassroomEditRequest.lecture_id.in_(lecture_ids))
+        .delete(synchronize_session=False) if lecture_ids else 0
+    )
+    purged["youtube_edit_requests"] = (
+        db.query(YoutubeEditRequest).filter(YoutubeEditRequest.lecture_id.in_(lecture_ids))
+        .delete(synchronize_session=False) if lecture_ids else 0
+    )
+    purged["lectures"] = (
+        db.query(Lecture).filter(Lecture.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+    purged["helping_materials"] = (
+        db.query(HelpingMaterial).filter(HelpingMaterial.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+    purged["subject_classroom_links"] = (
+        db.query(SubjectClassroomLink).filter(SubjectClassroomLink.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+
+    # Fees
+    purged["fee_structures"] = (
+        db.query(FeeStructure).filter(FeeStructure.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+
+    # Core academic links: offerings, assignments, enrollments, requests
+    purged["teacher_subject_assignments"] = (
+        db.query(TeacherSubjectAssignment).filter(TeacherSubjectAssignment.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+    purged["enrollments"] = (
+        db.query(Enrollment).filter(Enrollment.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+    purged["subject_requests"] = (
+        db.query(SubjectRequest).filter(SubjectRequest.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+    purged["batch_subjects"] = (
+        db.query(BatchSubject).filter(BatchSubject.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+    purged["subject_levels"] = (
+        db.query(SubjectLevel).filter(SubjectLevel.subject_id == subject_id)
+        .delete(synchronize_session=False)
+    )
+
+    return purged
+
+
 @router.delete("/{subject_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_subject(
     subject_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin")),
 ):
-    """Delete Subject — with dependency check. This is a soft delete
-    (deleted_at + is_active=False, same convention as every other entity
-    in this schema), and it's blocked entirely if anything real is tied
-    to the subject: batch offerings, student enrollments, teacher
-    assignments, or subject requests. Those rows carry FKs to subjects.id
-    with no ON DELETE behavior defined, and more importantly represent
-    real academic history (a student's enrollment record, a teacher's
-    assignment) that a Delete click shouldn't silently orphan or hide.
-    If any exist, the Admin is pointed at Deactivate instead — the
-    reversible, non-destructive alternative above.
+    """Delete Subject — PERMANENT CASCADE PURGE, no dependency check.
+
+    Per product decision, this is no longer the reversible soft-delete it
+    used to be, and no longer blocks on active references. On call, this
+    hard-deletes the subject AND every row anywhere in the schema that
+    points at it — batch offerings, enrollments, teacher assignments,
+    subject requests, timetable slots, attendance records, assessments,
+    marks (+ mark edit requests), grades, lectures (+ their edit
+    requests), helping materials, the classroom link, and fee structures.
+    See _purge_subject_dependents for the full list and the FK-safe order
+    it runs in.
+
+    THIS IS IRREVERSIBLE: student enrollment history, marks, attendance,
+    and teacher assignment records tied to this subject are destroyed
+    along with it, not archived. If that history needs to be preserved,
+    use PATCH .../status (is_active=False) instead — this endpoint no
+    longer offers a safety net.
     """
     subject = _load_subject_or_404(db, subject_id)
-
-    blockers: list[str] = []
-
-    offering_count = (
-        db.query(func.count(BatchSubject.id))
-        .filter(BatchSubject.subject_id == subject_id)
-        .scalar()
-    )
-    if offering_count:
-        blockers.append(f"{offering_count} batch offering(s)")
-
-    enrollment_count = (
-        db.query(func.count(Enrollment.id))
-        .filter(Enrollment.subject_id == subject_id, Enrollment.deleted_at.is_(None))
-        .scalar()
-    )
-    if enrollment_count:
-        blockers.append(f"{enrollment_count} active enrollment(s)")
-
-    assignment_count = (
-        db.query(func.count(TeacherSubjectAssignment.id))
-        .filter(
-            TeacherSubjectAssignment.subject_id == subject_id,
-            TeacherSubjectAssignment.deleted_at.is_(None),
-        )
-        .scalar()
-    )
-    if assignment_count:
-        blockers.append(f"{assignment_count} teacher assignment(s)")
-
-    request_count = (
-        db.query(func.count(SubjectRequest.id))
-        .filter(SubjectRequest.subject_id == subject_id, SubjectRequest.deleted_at.is_(None))
-        .scalar()
-    )
-    if request_count:
-        blockers.append(f"{request_count} subject request(s)")
-
-    if blockers:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Cannot delete '{subject.name}' — it's still referenced by "
-                f"{', '.join(blockers)}. Deactivate it instead to hide it from "
-                "new offerings while keeping this history intact."
-            ),
-        )
-
     old_value = {"name": subject.name, "code": subject.code, "is_active": subject.is_active}
-    subject.deleted_at = datetime.now(timezone.utc)
-    subject.is_active = False
 
-    log_action(db, current_user.id, "subject_deleted", "subjects", subject.id, old_value, None)
-    db.commit()
+    try:
+        purged_counts = _purge_subject_dependents(db, subject_id)
+        db.delete(subject)
+        log_action(
+            db, current_user.id, "subject_deleted", "subjects", subject.id,
+            old_value, {"hard_deleted": True, "purged": purged_counts},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
     return None

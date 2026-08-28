@@ -2,16 +2,33 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, field_validator
+
+from app.schemas.common import ApprovalStatus, MaterialType as MaterialTypeInput
+from app.utils.sanitize import sanitize_required_text, sanitize_text
 
 
 class HelpingMaterialCreate(BaseModel):
     subject_id: uuid.UUID
-    material_type: str  # notes | worksheet | past_paper | other
+    material_type: MaterialTypeInput
     title: str
     description: Optional[str] = None
     gcr_resource_id: Optional[str] = None
     gcr_link: str
+
+    # Stored-XSS defense-in-depth: strip any HTML/script payload out of
+    # free-text input before it ever reaches the DB. title is required, so
+    # a markup-only payload (e.g. "<b></b>") must still 422 rather than
+    # sanitize down to an empty string.
+    @field_validator("title")
+    @classmethod
+    def _sanitize_title(cls, v: str) -> str:
+        return sanitize_required_text(v)
+
+    @field_validator("description")
+    @classmethod
+    def _sanitize_description(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_text(v)
 
 
 class HelpingMaterialOut(BaseModel):
@@ -46,6 +63,16 @@ class LectureCreate(BaseModel):
     title: str
     description: Optional[str] = None
     youtube_url: str
+
+    @field_validator("title")
+    @classmethod
+    def _sanitize_title(cls, v: str) -> str:
+        return sanitize_required_text(v)
+
+    @field_validator("description")
+    @classmethod
+    def _sanitize_description(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_text(v)
 
 
 class LectureOut(BaseModel):
@@ -88,6 +115,11 @@ class RequestClassroomEditRequest(BaseModel):
     proposed_url: HttpUrl
     reason: str
 
+    @field_validator("reason")
+    @classmethod
+    def _sanitize_reason(cls, v: str) -> str:
+        return sanitize_required_text(v)
+
 
 class ClassroomEditRequestOut(BaseModel):
     id: uuid.UUID
@@ -113,8 +145,13 @@ class ClassroomRequestReview(BaseModel):
     """Task 2.2 — Approve/Reject. review_note is the Coordinator/Admin's
     optional note (shown to the Teacher either way); required for neither
     outcome, but most useful on reject."""
-    status: str  # approved | rejected
+    status: ApprovalStatus
     review_note: Optional[str] = None
+
+    @field_validator("review_note")
+    @classmethod
+    def _sanitize_review_note(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_text(v)
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +175,11 @@ class RequestYoutubeEditRequest(BaseModel):
     """Teacher proposes a change to an already-locked video."""
     proposed_url: str
     reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def _sanitize_reason(cls, v: str) -> str:
+        return sanitize_required_text(v)
 
 
 class YoutubeEditRequestOut(BaseModel):
@@ -164,8 +206,13 @@ class YoutubeRequestReview(BaseModel):
     """Approve/Reject. review_note is the Coordinator/Admin's optional note
     (shown to the Teacher either way); required for neither outcome, but
     most useful on reject."""
-    status: str  # approved | rejected
+    status: ApprovalStatus
     review_note: Optional[str] = None
+
+    @field_validator("review_note")
+    @classmethod
+    def _sanitize_review_note(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_text(v)
 
 
 # ---------------------------------------------------------------------------

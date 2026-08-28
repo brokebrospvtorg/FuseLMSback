@@ -14,15 +14,6 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # ---------------------------------------------------------------------------
 # Admin Role Isolation Guard
 # ---------------------------------------------------------------------------
-# Accounts with role 'admin' (or 'superadmin' — not yet a live UserRole enum
-# value, guarded pre-emptively so this doesn't quietly regress the day it's
-# added) are strictly root-level super-users/system management identities.
-# They must never be assignable as a Teacher anywhere a teacher_id is
-# accepted — TeacherSubjectAssignment (app/routers/academic.py) and
-# TimetableSlot (app/routers/timetable.py) both accept a teacher_id and are
-# the two places this has to be enforced. This lives in security.py (rather
-# than duplicated inline in each router) so every call site shares one
-# definition of "who counts as an admin" and one error message.
 ADMIN_ROLES = frozenset({"admin", "superadmin"})
 
 
@@ -32,20 +23,6 @@ def is_admin_role(role: str) -> bool:
 
 
 def guard_teacher_assignee_role(role: str, *, context: str = "a Teacher") -> None:
-    """
-    Root Role Isolation Guard: raises 400 if `role` (the role of the user
-    being assigned) is an admin-tier role. Call this at every write path
-    that accepts a teacher_id/teacher_user_id — before the row is created
-    or updated, never after — so an Admin/Superadmin account can never end
-    up attached to a Batch, Subject, or Timetable Slot as the teacher.
-
-    This is a defense-in-depth check: some call sites additionally query
-    for teacher_id scoped to role == 'teacher' (or a Coordinator with a
-    legacy TeacherProfile) and would already 404 an admin's id via that
-    filter alone. This guard exists so the rejection is explicit,
-    intentional, and produces a clear 400 rather than relying solely on an
-    incidental side effect of an unrelated eligibility filter.
-    """
     if is_admin_role(role):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -97,6 +74,38 @@ def set_auth_cookie(response: Response, token: str) -> None:
 
 def clear_auth_cookie(response: Response) -> None:
     response.delete_cookie(key=settings.COOKIE_NAME, path="/")
+
+
+# ---------------------------------------------------------------------------
+# CSRF token (double-submit cookie pattern)
+# ---------------------------------------------------------------------------
+# Frontend and backend are on different registrable domains (Vercel /
+# Railway), so the frontend can't read this cookie directly via
+# document.cookie — it's delivered to the client via the X-CSRF-Token
+# response header on /login and /me instead (see routers/auth.py). The
+# cookie itself is still what gets validated: on every unsafe request the
+# CSRFMiddleware (main.py) checks that the cookie value and the
+# X-CSRF-Token request header match. An attacker's cross-site form/fetch
+# can make the browser attach the cookie automatically, but has no way to
+# read its value to also set the header, so the two won't match.
+def generate_csrf_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def set_csrf_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=settings.CSRF_COOKIE_NAME,
+        value=token,
+        httponly=False,       # must be sendable by the browser as a normal cookie; never read via JS
+        secure=True,
+        samesite="none",      # same cross-domain requirement as the auth cookie
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        path="/",
+    )
+
+
+def clear_csrf_cookie(response: Response) -> None:
+    response.delete_cookie(key=settings.CSRF_COOKIE_NAME, path="/")
 
 
 # ---------------------------------------------------------------------------

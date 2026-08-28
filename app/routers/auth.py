@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
@@ -9,6 +10,7 @@ from app.core.limiter import limiter
 from app.core.security import (
     verify_password, hash_password, create_access_token,
     set_auth_cookie, clear_auth_cookie, generate_verification_token,
+    generate_csrf_token, set_csrf_cookie, clear_csrf_cookie,
 )
 from app.core.config import settings
 from app.models import (
@@ -24,6 +26,7 @@ from app.schemas.auth import (
 from app.utils.email import send_email
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+logger = logging.getLogger("fuse_lms.auth")
 
 
 @router.post("/login", response_model=UserOut)
@@ -60,6 +63,10 @@ def login(request: Request, payload: LoginRequest, response: Response, db: Sessi
     token = create_access_token(str(user.id), user.role)
     set_auth_cookie(response, token)
 
+    csrf_token = generate_csrf_token()
+    set_csrf_cookie(response, csrf_token)
+    response.headers[settings.CSRF_HEADER_NAME] = csrf_token
+
     user.last_login_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(user)
@@ -69,11 +76,18 @@ def login(request: Request, payload: LoginRequest, response: Response, db: Sessi
 @router.post("/logout")
 def logout(response: Response):
     clear_auth_cookie(response)
+    clear_csrf_cookie(response)
     return {"detail": "Logged out"}
 
 
 @router.get("/me", response_model=UserOut)
-def me(current_user: User = Depends(get_current_user)):
+def me(response: Response, current_user: User = Depends(get_current_user)):
+    # Refreshes the CSRF cookie/header pair on every app-boot session
+    # check, so a page reload doesn't leave the frontend holding a token
+    # value it no longer has after sessionStorage/memory was cleared.
+    csrf_token = generate_csrf_token()
+    set_csrf_cookie(response, csrf_token)
+    response.headers[settings.CSRF_HEADER_NAME] = csrf_token
     return current_user
 
 
@@ -136,11 +150,19 @@ def submit_activation(request: Request, payload: ActivationSubmitRequest, db: Se
     try:
         db.commit()
         db.refresh(user)
-    except Exception as e:
+    except Exception:
         db.rollback()
+        # Info-disclosure fix: never return str(e) to the client — a raw
+        # DB/driver exception can surface table/column/constraint names or
+        # fragments of the failing statement, and this endpoint is reached
+        # by an unauthenticated caller. Log the real exception server-side
+        # (with the token's user_id for correlation) and return a generic,
+        # non-parameterized message instead — same pattern as users.py /
+        # fees.py's exception handlers.
+        logger.exception("POST /api/auth/submit-activation failed to commit for user_id=%s", vt.user_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database commit failed: {str(e)}"
+            detail="Account activation failed. Please try again or contact support.",
         )
 
     return user

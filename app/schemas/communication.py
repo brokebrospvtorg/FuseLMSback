@@ -2,7 +2,10 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from app.schemas.common import ComplaintStatus as ComplaintStatusInput
+from app.utils.sanitize import sanitize_required_text, sanitize_text
 
 
 class ComplaintCreate(BaseModel):
@@ -13,10 +16,22 @@ class ComplaintCreate(BaseModel):
     subject_of_complaint: Optional[str] = None
     description: str
 
+    # Stored-XSS defense-in-depth: strip any HTML/script payload out of
+    # free-text input before it ever reaches the DB.
+    @field_validator("description")
+    @classmethod
+    def _sanitize_description(cls, v: str) -> str:
+        return sanitize_required_text(v)
+
 
 class ComplaintUpdate(BaseModel):
-    status: str  # open | in_progress | resolved | closed
+    status: ComplaintStatusInput
     resolution_message: Optional[str] = None
+
+    @field_validator("resolution_message")
+    @classmethod
+    def _sanitize_resolution_message(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_text(v)
 
 
 class ComplaintOut(BaseModel):

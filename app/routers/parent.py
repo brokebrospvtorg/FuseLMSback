@@ -130,18 +130,54 @@ def child_report_card(student_id: uuid.UUID, db: Session = Depends(get_db),
     (same 'only published assessments' privacy rule — a parent shouldn't
     see a mark before the student themselves would), just combined into
     one call and scoped to student_id instead of current_user.id.
+
+    Same fix as /me/grades in student_grades.py: Grade is keyed on
+    (student_id, subject_id, batch_id), so a student with grade history in
+    more than one batch has more than one Grade row per subject_id -- scope
+    to the current batch (and de-dup defensively) so each subject renders
+    as exactly one card, and drop any subject that's deactivated or whose
+    enrollment link isn't active, so it disappears from both the Parent
+    and Student report cards.
     """
     _verify_linked_child(db, current_user.id, student_id)
 
     grade_rows = (
         db.query(Grade, Subject.name.label("subject_name"))
         .join(Subject, Subject.id == Grade.subject_id)
-        .filter(Grade.student_id == student_id, Grade.deleted_at.is_(None))
+        .join(Batch, Batch.id == Grade.batch_id)
+        .join(
+            Enrollment,
+            (Enrollment.student_id == Grade.student_id)
+            & (Enrollment.subject_id == Grade.subject_id)
+            & (Enrollment.batch_id == Grade.batch_id),
+        )
+        .filter(
+            Grade.student_id == student_id,
+            Grade.deleted_at.is_(None),
+            Subject.is_active.is_(True),
+            Subject.deleted_at.is_(None),
+            Batch.is_current.is_(True),
+            Batch.deleted_at.is_(None),
+            Enrollment.status == "active",
+            Enrollment.deleted_at.is_(None),
+        )
         .all()
     )
 
-    result = []
+    # Defensive de-dup -- see student_grades.py::my_grade_report for why
+    # this is needed even after scoping to the current batch.
+    by_subject: dict = {}
     for grade, subject_name in grade_rows:
+        existing = by_subject.get(grade.subject_id)
+        if existing is None or (
+            grade.last_computed_at and (
+                existing[0].last_computed_at is None or grade.last_computed_at > existing[0].last_computed_at
+            )
+        ):
+            by_subject[grade.subject_id] = (grade, subject_name)
+
+    result = []
+    for grade, subject_name in by_subject.values():
         mark_rows = (
             db.query(Mark, Assessment.name.label("assessment_name"), Assessment.max_marks)
             .join(Assessment, Assessment.id == Mark.assessment_id)

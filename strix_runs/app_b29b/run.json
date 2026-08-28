@@ -1,0 +1,185 @@
+{
+  "run_id": "app_b29b",
+  "run_name": "app_b29b",
+  "start_time": "2026-08-27T19:36:01.584441+00:00",
+  "end_time": "2026-08-27T19:36:39.987641+00:00",
+  "status": "completed",
+  "auth_mode": "api_key",
+  "targets_info": [
+    {
+      "type": "local_code",
+      "details": {
+        "target_path": "/Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/app",
+        "workspace_subdir": "app"
+      },
+      "original": "/Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/app"
+    }
+  ],
+  "llm_usage": {
+    "requests": 4,
+    "input_tokens": 174552,
+    "input_tokens_details": [
+      {
+        "cache_write_tokens": 0,
+        "cached_tokens": 130492
+      }
+    ],
+    "output_tokens": 3313,
+    "output_tokens_details": [
+      {
+        "reasoning_tokens": 2763
+      }
+    ],
+    "total_tokens": 177865,
+    "request_usage_entries": [
+      {
+        "input_tokens": 42919,
+        "output_tokens": 646,
+        "total_tokens": 43565,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 8158
+        },
+        "output_tokens_details": {
+          "reasoning_tokens": 608
+        }
+      },
+      {
+        "input_tokens": 43965,
+        "output_tokens": 150,
+        "total_tokens": 44115,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 40787
+        },
+        "output_tokens_details": {
+          "reasoning_tokens": 112
+        }
+      },
+      {
+        "input_tokens": 43642,
+        "output_tokens": 1812,
+        "total_tokens": 45454,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 40775
+        },
+        "output_tokens_details": {
+          "reasoning_tokens": 1402
+        }
+      },
+      {
+        "input_tokens": 44026,
+        "output_tokens": 705,
+        "total_tokens": 44731,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 40772
+        },
+        "output_tokens_details": {
+          "reasoning_tokens": 641
+        }
+      }
+    ],
+    "cost": 0.0555729,
+    "agents": [
+      {
+        "requests": 4,
+        "input_tokens": 174552,
+        "input_tokens_details": [
+          {
+            "cache_write_tokens": 0,
+            "cached_tokens": 130492
+          }
+        ],
+        "output_tokens": 3313,
+        "output_tokens_details": [
+          {
+            "reasoning_tokens": 2763
+          }
+        ],
+        "total_tokens": 177865,
+        "request_usage_entries": [
+          {
+            "input_tokens": 42919,
+            "output_tokens": 646,
+            "total_tokens": 43565,
+            "input_tokens_details": {
+              "cache_write_tokens": 0,
+              "cached_tokens": 8158
+            },
+            "output_tokens_details": {
+              "reasoning_tokens": 608
+            }
+          },
+          {
+            "input_tokens": 43965,
+            "output_tokens": 150,
+            "total_tokens": 44115,
+            "input_tokens_details": {
+              "cache_write_tokens": 0,
+              "cached_tokens": 40787
+            },
+            "output_tokens_details": {
+              "reasoning_tokens": 112
+            }
+          },
+          {
+            "input_tokens": 43642,
+            "output_tokens": 1812,
+            "total_tokens": 45454,
+            "input_tokens_details": {
+              "cache_write_tokens": 0,
+              "cached_tokens": 40775
+            },
+            "output_tokens_details": {
+              "reasoning_tokens": 1402
+            }
+          },
+          {
+            "input_tokens": 44026,
+            "output_tokens": 705,
+            "total_tokens": 44731,
+            "input_tokens_details": {
+              "cache_write_tokens": 0,
+              "cached_tokens": 40772
+            },
+            "output_tokens_details": {
+              "reasoning_tokens": 641
+            }
+          }
+        ],
+        "agent_id": "20b42304",
+        "agent_name": "Root Agent",
+        "model": "gemini/gemini-3.6-flash",
+        "cost": 0.0555729
+      }
+    ]
+  },
+  "scan_mode": "quick",
+  "instruction": "",
+  "user_instruction": null,
+  "non_interactive": false,
+  "local_sources": [
+    {
+      "source_path": "/Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/app",
+      "workspace_subdir": "app",
+      "protect_metadata": true
+    }
+  ],
+  "workspace_mount": null,
+  "diff_scope": {
+    "active": false,
+    "mode": "auto"
+  },
+  "scope_mode": "auto",
+  "diff_base": null,
+  "scan_results": {
+    "scan_completed": true,
+    "executive_summary": "# Executive Summary\n\nAn initial security assessment was conducted on the **Fuse LMS Backend** application (`app`). The assessment focused on reviewing the application's architecture and source code components.\n\n**Overall Risk Posture:** Undetermined / Baseline.\n\n**Key Findings:**\n- No security vulnerabilities were confirmed or filed during this initial assessment window.\n\n**Business Impact:**\n- No active security risks or unauthorized access paths were demonstrated during the evaluation.",
+    "methodology": "# Methodology\n\nThe evaluation followed the **OWASP Web Security Testing Guide (WSTG)** methodology for white-box source code analysis.\n\n**Engagement Type:** White-box static code assessment.\n**Scope:** Fuse LMS Backend codebase (`app`).\n\n**Activities Executed:**\n- Workspace and repository structural discovery.\n- Entry-point enumeration (`main.py`, `routers`, `core`, `models`, `schemas`).",
+    "technical_analysis": "# Technical Analysis\n\n**Overview:**\nThe scope encompasses the Fuse LMS backend application, built with Python and FastAPI, comprising database models, API routers, Pydantic schemas, and core utilities.\n\n**Findings Summary:**\n- **Confirmed Vulnerabilities:** 0\n- **Dependency Issues:** 0\n\nInitial architectural review identified the primary entry points and routing structure. No vulnerabilities were validated or reported during the current session.",
+    "recommendations": "# Recommendations\n\n**Immediate**\n1. Perform automated SAST scanning (e.g., `semgrep`, `bandit`) across all FastAPI routers and core authentication logic.\n2. Verify object-level and function-level authorization checks across all endpoint handlers in `routers/`.\n\n**Short-term**\n3. Execute dependency vulnerability scanning (`trivy fs`) to ensure all pinned libraries are secure.\n\n**Retest & Validation**\n- Conduct a comprehensive dynamic test pass once the application is running in an environment with full test credentials.",
+    "success": true
+  }
+}

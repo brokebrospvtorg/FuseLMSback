@@ -1,0 +1,135 @@
+2026-08-28 00:36:04.482 INFO    app_b29b - strix.core.runner: Starting Strix scan app_b29b (image=ghcr.io/usestrix/strix-sandbox:1.3.0, max_turns=3, interactive=True, run_dir=/Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b)
+2026-08-28 00:36:04.482 INFO    app_b29b - strix.core.runner: LLM model resolved: gemini/gemini-3.6-flash
+2026-08-28 00:36:04.482 INFO    app_b29b - strix.core.runner: Bringing up sandbox session for scan app_b29b
+2026-08-28 00:36:04.482 DEBUG   app_b29b - strix.runtime.backends: Selected sandbox backend: docker
+2026-08-28 00:36:04.483 INFO    app_b29b - strix.runtime.session_manager: Creating sandbox session for scan app_b29b (backend=docker, image=ghcr.io/usestrix/strix-sandbox:1.3.0)
+2026-08-28 00:36:04.579 DEBUG   app_b29b - strix.runtime.docker_client: Creating sandbox container: image=ghcr.io/usestrix/strix-sandbox:1.3.0 caps=['NET_ADMIN', 'NET_RAW'] exposed_ports=[48080]
+2026-08-28 00:36:04.732 INFO    app_b29b - strix.runtime.docker_client: Sandbox container created: id=ef6d3beb2212 image=ghcr.io/usestrix/strix-sandbox:1.3.0
+2026-08-28 00:36:05.965 DEBUG   app_b29b - strix.runtime.session_manager: Caido host endpoint resolved: http://127.0.0.1:55603
+2026-08-28 00:36:05.965 INFO    app_b29b - strix.runtime.caido_bootstrap: Bootstrapping Caido client (host=http://127.0.0.1:55603, container=http://127.0.0.1:48080)
+2026-08-28 00:36:06.340 DEBUG   app_b29b - strix.runtime.caido_bootstrap: loginAsGuest attempt 1/10 failed: curl exit 7: curl: (7) Failed to connect to 127.0.0.1 port 48080 after 0 ms: Could not connect to server
+
+2026-08-28 00:36:08.735 INFO    app_b29b - strix.runtime.caido_bootstrap: Caido project selected: 55af177b-1deb-47f3-af6c-07b2ed448e8e
+2026-08-28 00:36:08.735 INFO    app_b29b - strix.runtime.session_manager: Sandbox session for scan app_b29b ready and cached
+2026-08-28 00:36:08.735 INFO    app_b29b - strix.core.runner: Sandbox ready for scan app_b29b
+2026-08-28 00:36:08.742 DEBUG   app_b29b - strix.skills: Loaded skill: scan_modes/quick -> quick
+2026-08-28 00:36:08.744 DEBUG   app_b29b - strix.skills: Loaded skill: tooling/agent_browser -> agent_browser
+2026-08-28 00:36:08.749 DEBUG   app_b29b - strix.skills: Loaded skill: tooling/python -> python
+2026-08-28 00:36:08.752 DEBUG   app_b29b - strix.skills: Loaded skill: coordination/root_agent -> root_agent
+2026-08-28 00:36:08.755 DEBUG   app_b29b - strix.skills: Loaded skill: coordination/source_aware_whitebox -> source_aware_whitebox
+2026-08-28 00:36:08.758 DEBUG   app_b29b - strix.skills: Loaded skill: custom/source_aware_sast -> source_aware_sast
+2026-08-28 00:36:08.760 DEBUG   app_b29b - strix.skills: load_skills: 6 skill(s) resolved
+2026-08-28 00:36:08.840 DEBUG   app_b29b - strix.agents.prompt: render_system_prompt: scan_mode=quick root=True whitebox=True skills=6 prompt_len=82360
+2026-08-28 00:36:08.840 INFO    app_b29b - strix.agents.factory: Built root agent 'Root Agent' (skills=0, tools=31, scan_mode=quick, whitebox=True)
+2026-08-28 00:36:08.841 INFO    app_b29b - strix.core.agents: agent.register 20b42304 (Root Agent) parent=-
+2026-08-28 00:36:08.887 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating trace
+2026-08-28 00:36:08.889 DEBUG   app_b29b - openai.agents: Setting current trace: no-op
+2026-08-28 00:36:08.889 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:36:08.908 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:36:08.908 DEBUG   app_b29b - openai.agents: Starting turn 1, current_agent=Root Agent
+2026-08-28 00:36:08.908 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:36:08.911 DEBUG   app_b29b - openai.agents: No conversation_id available for request
+2026-08-28 00:36:08.911 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:36:08.913 DEBUG   app_b29b - openai.agents: Calling LLM
+2026-08-28 00:36:10.195 DEBUG   - - strix.telemetry.posthog: posthog event sent: skill_loaded
+2026-08-28 00:36:10.200 DEBUG   - - strix.telemetry.posthog: posthog event sent: skill_loaded
+2026-08-28 00:36:10.205 DEBUG   - - strix.telemetry.posthog: posthog event sent: skill_loaded
+2026-08-28 00:36:10.208 DEBUG   - - strix.telemetry.posthog: posthog event sent: skill_loaded
+2026-08-28 00:36:10.213 DEBUG   - - strix.telemetry.posthog: posthog event sent: skill_loaded
+2026-08-28 00:36:10.219 DEBUG   - - strix.telemetry.posthog: posthog event sent: skill_loaded
+2026-08-28 00:36:11.929 DEBUG   - - strix.telemetry.scarf: scarf event sent: skill_loaded
+2026-08-28 00:36:12.317 DEBUG   - - strix.telemetry.scarf: scarf event sent: skill_loaded
+2026-08-28 00:36:12.320 DEBUG   - - strix.telemetry.scarf: scarf event sent: skill_loaded
+2026-08-28 00:36:12.323 DEBUG   - - strix.telemetry.scarf: scarf event sent: skill_loaded
+2026-08-28 00:36:12.327 DEBUG   - - strix.telemetry.scarf: scarf event sent: skill_loaded
+2026-08-28 00:36:12.329 DEBUG   - - strix.telemetry.scarf: scarf event sent: skill_loaded
+2026-08-28 00:36:15.441 INFO    app_b29b - strix.report.sarif: Wrote SARIF 2.1.0 report: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b/findings.sarif (0 results)
+2026-08-28 00:36:15.443 INFO    app_b29b - strix.report.state: Essential scan data saved to: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b
+2026-08-28 00:36:15.447 DEBUG   app_b29b - openai.agents: Processing output item type=reasoning class=ResponseReasoningItem
+2026-08-28 00:36:15.447 DEBUG   app_b29b - openai.agents: Processing output item type=message class=ResponseOutputMessage
+2026-08-28 00:36:15.448 DEBUG   app_b29b - openai.agents: Processing output item type=function_call class=ResponseFunctionToolCall
+2026-08-28 00:36:15.450 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:36:16.533 DEBUG   app_b29b - openai.agents: Turn 1 complete, next_step type=NextStepRunAgain
+2026-08-28 00:36:16.634 DEBUG   app_b29b - openai.agents: Starting turn 2, current_agent=Root Agent
+2026-08-28 00:36:16.635 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:36:16.642 DEBUG   app_b29b - openai.agents: No conversation_id available for request
+2026-08-28 00:36:16.643 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:36:16.651 DEBUG   app_b29b - openai.agents: Calling LLM
+2026-08-28 00:36:19.686 INFO    app_b29b - strix.report.sarif: Wrote SARIF 2.1.0 report: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b/findings.sarif (0 results)
+2026-08-28 00:36:19.691 INFO    app_b29b - strix.report.state: Essential scan data saved to: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b
+2026-08-28 00:36:19.692 DEBUG   app_b29b - openai.agents: Processing output item type=message class=ResponseOutputMessage
+2026-08-28 00:36:19.692 DEBUG   app_b29b - openai.agents: Processing output item type=function_call class=ResponseFunctionToolCall
+2026-08-28 00:36:19.699 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:36:20.825 DEBUG   app_b29b - openai.agents: Turn 2 complete, next_step type=NextStepRunAgain
+2026-08-28 00:36:20.854 DEBUG   app_b29b - openai.agents: Starting turn 3, current_agent=Root Agent
+2026-08-28 00:36:20.854 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:36:20.858 DEBUG   app_b29b - openai.agents: No conversation_id available for request
+2026-08-28 00:36:20.859 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:36:20.875 DEBUG   app_b29b - openai.agents: Calling LLM
+2026-08-28 00:36:37.666 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /?token=TbxTUXvQWYzMbiaypPLYVZQhAnkmpX5CTHR8tc-7wBY HTTP/1.1" 200 -
+2026-08-28 00:36:37.782 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /assets/index-DKbLYAbP.css HTTP/1.1" 200 -
+2026-08-28 00:36:37.801 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /assets/index-DBJ-RJqo.js HTTP/1.1" 200 -
+2026-08-28 00:36:38.201 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /logo.png HTTP/1.1" 200 -
+2026-08-28 00:36:38.259 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/auth/status HTTP/1.1" 200 -
+2026-08-28 00:36:38.267 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/runs HTTP/1.1" 200 -
+2026-08-28 00:36:38.270 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/capabilities HTTP/1.1" 200 -
+2026-08-28 00:36:38.276 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /logo.png HTTP/1.1" 200 -
+2026-08-28 00:36:38.281 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/run HTTP/1.1" 200 -
+2026-08-28 00:36:38.303 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/report HTTP/1.1" 200 -
+2026-08-28 00:36:38.306 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/vulnerabilities HTTP/1.1" 200 -
+2026-08-28 00:36:38.313 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/transcript HTTP/1.1" 200 -
+2026-08-28 00:36:38.829 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/run HTTP/1.1" 200 -
+2026-08-28 00:36:38.852 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/vulnerabilities HTTP/1.1" 200 -
+2026-08-28 00:36:38.856 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/transcript HTTP/1.1" 200 -
+2026-08-28 00:36:39.364 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/run HTTP/1.1" 200 -
+2026-08-28 00:36:39.372 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/vulnerabilities HTTP/1.1" 200 -
+2026-08-28 00:36:39.376 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/transcript HTTP/1.1" 200 -
+2026-08-28 00:36:39.883 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/run HTTP/1.1" 200 -
+2026-08-28 00:36:39.892 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/vulnerabilities HTTP/1.1" 200 -
+2026-08-28 00:36:39.896 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/transcript HTTP/1.1" 200 -
+2026-08-28 00:36:39.954 DEBUG   - - strix.telemetry.posthog: posthog event sent: viewer_opened
+2026-08-28 00:36:39.981 INFO    app_b29b - strix.report.sarif: Wrote SARIF 2.1.0 report: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b/findings.sarif (0 results)
+2026-08-28 00:36:39.982 INFO    app_b29b - strix.report.state: Essential scan data saved to: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b
+2026-08-28 00:36:39.983 DEBUG   app_b29b - openai.agents: Processing output item type=reasoning class=ResponseReasoningItem
+2026-08-28 00:36:39.983 DEBUG   app_b29b - openai.agents: Processing output item type=function_call class=ResponseFunctionToolCall
+2026-08-28 00:36:39.984 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:36:39.986 DEBUG   app_b29b - openai.agents: Invoking tool finish_scan
+2026-08-28 00:36:39.987 INFO    app_b29b - strix.report.state: Updated scan final fields
+2026-08-28 00:36:39.988 INFO    app_b29b - strix.report.writer: Saved final penetration test report to: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b/penetration_test_report.md
+2026-08-28 00:36:39.992 INFO    app_b29b - strix.report.sarif: Wrote SARIF 2.1.0 report: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b/findings.sarif (0 results)
+2026-08-28 00:36:39.993 INFO    app_b29b - strix.report.state: Essential scan data saved to: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b
+2026-08-28 00:36:40.405 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/run HTTP/1.1" 200 -
+2026-08-28 00:36:40.411 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/run HTTP/1.1" 200 -
+2026-08-28 00:36:40.421 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/report HTTP/1.1" 200 -
+2026-08-28 00:36:40.422 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/vulnerabilities HTTP/1.1" 200 -
+2026-08-28 00:36:40.427 DEBUG   - - strix.interface.viewer.server: viewer 127.0.0.1 - "GET /api/transcript HTTP/1.1" 200 -
+2026-08-28 00:36:41.285 DEBUG   app_b29b - strix.telemetry.posthog: posthog event sent: scan_ended
+2026-08-28 00:36:43.075 DEBUG   app_b29b - strix.telemetry.scarf: scarf event sent: scan_ended
+2026-08-28 00:36:43.075 INFO    app_b29b - strix.tools.finish.tool: finish_scan: completed scan with 0 vulnerability report(s)
+2026-08-28 00:36:43.076 INFO    app_b29b - strix.core.agents: agent.status 20b42304=completed
+2026-08-28 00:36:43.078 DEBUG   app_b29b - openai.agents: Tool finish_scan completed.
+2026-08-28 00:36:43.080 DEBUG   app_b29b - openai.agents: Turn 3 complete, next_step type=NextStepFinalOutput
+2026-08-28 00:36:43.096 DEBUG   app_b29b - openai.agents: Resetting current trace
+2026-08-28 00:38:53.916 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating trace
+2026-08-28 00:38:53.918 DEBUG   app_b29b - openai.agents: Setting current trace: no-op
+2026-08-28 00:38:53.918 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:38:53.939 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:38:53.939 DEBUG   app_b29b - openai.agents: Starting turn 1, current_agent=Root Agent
+2026-08-28 00:38:53.939 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:38:53.941 DEBUG   app_b29b - openai.agents: No conversation_id available for request
+2026-08-28 00:38:53.942 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:38:53.943 DEBUG   app_b29b - openai.agents: Calling LLM
+2026-08-28 00:39:00.614 INFO    app_b29b - strix.report.writer: Saved final penetration test report to: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b/penetration_test_report.md
+2026-08-28 00:39:00.622 INFO    app_b29b - strix.report.sarif: Wrote SARIF 2.1.0 report: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b/findings.sarif (0 results)
+2026-08-28 00:39:00.625 INFO    app_b29b - strix.report.state: Essential scan data saved to: /Users/indus/Desktop/Projects/Fuse LMS/FuseLMS/fuse_lms_backend-updated (2)/strix_runs/app_b29b
+2026-08-28 00:39:00.625 DEBUG   app_b29b - openai.agents: Processing output item type=reasoning class=ResponseReasoningItem
+2026-08-28 00:39:00.625 DEBUG   app_b29b - openai.agents: Processing output item type=function_call class=ResponseFunctionToolCall
+2026-08-28 00:39:00.626 DEBUG   app_b29b - openai.agents: Tracing is disabled. Not creating span
+2026-08-28 00:39:00.626 DEBUG   app_b29b - openai.agents: Invoking tool respond_to_user
+2026-08-28 00:39:00.627 INFO    app_b29b - strix.core.agents: agent.status 20b42304=waiting
+2026-08-28 00:39:00.627 DEBUG   app_b29b - openai.agents: Tool respond_to_user completed.
+2026-08-28 00:39:00.628 DEBUG   app_b29b - openai.agents: Turn 1 complete, next_step type=NextStepFinalOutput
+2026-08-28 00:39:00.632 DEBUG   app_b29b - openai.agents: Resetting current trace
+2026-08-28 00:39:10.172 INFO    app_b29b - strix.core.runner: Tearing down sandbox session for scan app_b29b
+2026-08-28 00:39:10.369 INFO    app_b29b - strix.runtime.session_manager: Cleaned up sandbox session for scan app_b29b
+2026-08-28 00:39:10.371 INFO    app_b29b - strix.core.runner: Strix scan app_b29b done

@@ -13,13 +13,17 @@ from app.schemas.common import BoardEnum
 # letting it fall through to a raw IntegrityError from the DB enum (500).
 AttendanceStatusInput = Literal["present", "absent", "late", "excused"]
 
+# Same rationale as AttendanceStatusInput above — matches the Postgres enum
+# `day_of_week` (app/models/enums.py::DayOfWeek).
+DayOfWeekInput = Literal["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
 
 class TimetableSlotCreate(BaseModel):
     level_id: uuid.UUID
     subject_id: uuid.UUID
     teacher_id: uuid.UUID
     batch_id: uuid.UUID
-    day_of_week: str
+    day_of_week: DayOfWeekInput
     start_time: time
     end_time: time
 
@@ -285,6 +289,6 @@ class TimetableSlotUpdate(BaseModel):
     subject_id: Optional[uuid.UUID] = None
     teacher_id: Optional[uuid.UUID] = None
     batch_id: Optional[uuid.UUID] = None
-    day_of_week: Optional[str] = None
+    day_of_week: Optional[DayOfWeekInput] = None
     start_time: Optional[time] = None
     end_time: Optional[time] = None

@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.dependencies import require_roles, check_license
 from app.core.security import hash_password
+from app.core.config import settings
 from app.core.audit import log_action
 from app.core.notifications import notify
 from app.models import PasswordResetRequest, User, StudentProfile, TeacherProfile
@@ -50,7 +51,9 @@ router = APIRouter(
 # up. must_change_password=True on every approval is what keeps this safe
 # to be predictable: it is never the account's standing password, only a
 # one-time credential good for exactly one login.
-ADMIN_RESET_TEMP_PASSWORD = "Inkling@2026"
+# Sourced from Settings (app/core/config.py -> ADMIN_RESET_TEMP_PASSWORD env
+# var) instead of hardcoded, so it isn't a fixed value sitting in source
+# control and can differ per deployment.
 
 
 def _to_out(db: Session, req: PasswordResetRequest) -> PasswordResetRequestOut:
@@ -124,7 +127,7 @@ def review_password_reset_request(
     req.reviewed_at = datetime.now(timezone.utc)
 
     if payload.status == "approved":
-        target.password_hash = hash_password(ADMIN_RESET_TEMP_PASSWORD)
+        target.password_hash = hash_password(settings.ADMIN_RESET_TEMP_PASSWORD)
         target.must_change_password = True
         log_action(db, current_user.id, "password_reset_by_admin_request", "users", target.id, None,
                    {"request_id": str(req.id)})

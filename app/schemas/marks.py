@@ -3,7 +3,10 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.schemas.common import ApprovalStatus
+from app.utils.sanitize import sanitize_required_text, sanitize_text
 
 
 class AssessmentCreate(BaseModel):
@@ -68,13 +71,23 @@ class MarkEditRequestCreate(BaseModel):
     requested_change: dict  # e.g. {"marks_obtained": 82}
     reason: Optional[str] = None
 
+    @field_validator("reason")
+    @classmethod
+    def _sanitize_reason(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_text(v)
+
 
 class MarkEditRequestReview(BaseModel):
-    status: str  # approved | rejected
+    status: ApprovalStatus
     # Coordinator/Admin's note when approving/rejecting — same optional
     # reviewer-note pattern as FeeProofReview.rejection_reason and
     # ComplaintUpdate.resolution_message.
     review_note: Optional[str] = None
+
+    @field_validator("review_note")
+    @classmethod
+    def _sanitize_review_note(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_text(v)
 
 
 class MarkEditRequestOut(BaseModel):
@@ -139,6 +152,14 @@ class MarkOverrideRequest(BaseModel):
     the pooled percentage/grade is derived automatically afterwards."""
     marks_obtained: Decimal
     override_reason: str = Field(..., min_length=1)
+
+    # min_length=1 above only guards the raw payload; use the "required"
+    # variant so a payload that's pure markup (e.g. "<b></b>") still 422s
+    # instead of sanitizing down to an empty string and slipping through.
+    @field_validator("override_reason")
+    @classmethod
+    def _sanitize_override_reason(cls, v: str) -> str:
+        return sanitize_required_text(v)
 
 
 class RosterEntryOut(BaseModel):

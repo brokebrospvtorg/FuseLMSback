@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     COOKIE_DOMAIN: str = "localhost"
     COOKIE_NAME: str = "access_token"
 
+    CSRF_COOKIE_NAME: str = "csrf_token"
+    CSRF_HEADER_NAME: str = "X-CSRF-Token"
+
     FRONTEND_ORIGIN: str = "http://localhost:4200"
     ENVIRONMENT: str = "development"
 
@@ -48,6 +51,22 @@ class Settings(BaseSettings):
     # batch_utils.is_batch_over) — checked daily since that's cheap and
     # months don't roll over predictably on any single day-of-month.
     BATCH_EXPIRY_CRON_HOUR: int = 1  # runs daily at 01:00 server time
+
+    # --- Onboarding / admin-reset default passwords ---
+    # Fixed, predictable handoff values — never the account's standing
+    # password, since must_change_password=True is forced on every branch
+    # that uses them. Still Settings-backed (so an env var can override
+    # per deployment if you ever want to), but each one now has a safe
+    # fallback default matching the original hardcoded value — no .env
+    # changes required. Optionally override any of these in .env:
+    #   DEFAULT_TEACHER_INITIAL_PASSWORD=...
+    #   DEFAULT_STUDENT_INITIAL_PASSWORD=...
+    #   DEFAULT_PARENT_INITIAL_PASSWORD=...
+    #   ADMIN_RESET_TEMP_PASSWORD=...
+    DEFAULT_TEACHER_INITIAL_PASSWORD: str = "Inkling@2026"
+    DEFAULT_STUDENT_INITIAL_PASSWORD: str = "Inkling@2026"
+    DEFAULT_PARENT_INITIAL_PASSWORD: str = "Inkling@2026"
+    ADMIN_RESET_TEMP_PASSWORD: str = "Inkling@2026"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

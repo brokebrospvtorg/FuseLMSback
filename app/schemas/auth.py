@@ -2,7 +2,9 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+
+from app.schemas.common import ApprovalStatus, validate_password_strength
 
 
 class LoginRequest(BaseModel):
@@ -56,6 +58,11 @@ class PasswordResetSubmitRequest(BaseModel):
     token: str
     new_password: str = Field(min_length=8)
 
+    @field_validator("new_password")
+    @classmethod
+    def _validate_new_password(cls, v: str) -> str:
+        return validate_password_strength(v)
+
 
 class AdminPasswordResetRequestCreate(BaseModel):
     """POST /api/auth/request-password-reset-approval — the logged-out
@@ -89,7 +96,7 @@ class PasswordResetRequestReview(BaseModel):
     """PATCH .../review. 'approved' resets the password to the fixed
     onboarding value and forces a change on next login; 'rejected' just
     closes the request out with no password change."""
-    status: str  # approved | rejected
+    status: ApprovalStatus
     review_note: Optional[str] = None
 
 
@@ -102,6 +109,11 @@ class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str = Field(min_length=8)
     confirm_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def _validate_new_password(cls, v: str) -> str:
+        return validate_password_strength(v)
 
     @model_validator(mode="after")
     def passwords_match(self):
