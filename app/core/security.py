@@ -65,8 +65,14 @@ def set_auth_cookie(response: Response, token: str) -> None:
         key=settings.COOKIE_NAME,
         value=token,
         httponly=True,
-        secure=True,          # was: settings.COOKIE_SECURE — force True; SameSite=None requires it
-        samesite="none",      # was: "strict" — required cross-domain (vercel.app ↔ railway.app)
+        secure=True,           # keep True regardless of SameSite — still served over HTTPS
+        samesite="lax",        # was: "none". The frontend now proxies /api/* through its own
+                                # domain (see vercel.json), so this cookie is first-party again —
+                                # "none" was only ever needed for the old direct-to-Railway,
+                                # cross-site setup, and cross-site SameSite=None cookies are
+                                # exactly what Safari/WebKit ITP blocks on iOS (Safari + Chrome-
+                                # on-iOS both run WebKit). "lax" is not blocked by ITP and still
+                                # covers normal top-level navigation + same-site XHR/fetch.
         max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         path="/",
     )
@@ -98,7 +104,7 @@ def set_csrf_cookie(response: Response, token: str) -> None:
         value=token,
         httponly=False,       # must be sendable by the browser as a normal cookie; never read via JS
         secure=True,
-        samesite="none",      # same cross-domain requirement as the auth cookie
+        samesite="lax",       # same first-party reasoning as the auth cookie above
         max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         path="/",
     )
