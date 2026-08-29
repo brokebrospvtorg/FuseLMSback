@@ -5,7 +5,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
-from app.models.enums import UserRole, UserStatus, TokenType, CorrectionStatus, Board
+from app.models.enums import UserRole, UserStatus, TokenType, CorrectionStatus
 
 
 class User(Base):
@@ -43,10 +43,6 @@ class StudentProfile(Base):
     nationality = Column(Text)
     cnic = Column(Text)
     registration_id = Column(Text)
-    # schema_update_11: required Board the student is registered under
-    # (British Council / Edexcel / LRN). NOT NULL — every Student form
-    # submission (create or edit) must supply it.
-    board = Column(Board, nullable=False)
 
     user = relationship("User", back_populates="student_profile")
 
@@ -62,42 +58,17 @@ class TeacherProfile(Base):
     # designation Column REMOVED — see migration snippet below.
 
     user = relationship("User", back_populates="teacher_profile")
-    boards = relationship(
-        "TeacherBoard", back_populates="teacher_profile",
-        cascade="all, delete-orphan", passive_deletes=True,
-    )
     levels = relationship(
         "TeacherLevel", back_populates="teacher_profile",
         cascade="all, delete-orphan", passive_deletes=True,
     )
 
 
-class TeacherBoard(Base):
-    """
-    schema_update_11: which exam board(s) a Teacher is qualified to teach.
-    A join table (teacher_id, board) rather than a Postgres array column —
-    keeps each assignment a normal, queryable/indexable row (e.g. "which
-    teachers are qualified for Edexcel") and gives every row its own
-    created_at, same convention as the rest of this schema's link tables
-    (parent_student_links, teacher_subject_assignments, ...).
-    """
-    __tablename__ = "teacher_boards"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
-    teacher_id = Column(
-        UUID(as_uuid=True), ForeignKey("teacher_profiles.user_id", ondelete="CASCADE"), nullable=False,
-    )
-    board = Column(Board, nullable=False)
-    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
-
-    teacher_profile = relationship("TeacherProfile", back_populates="boards")
-
 class TeacherLevel(Base):
     """
     Teacher Multi-Level Assignment: which academic level(s) a Teacher is
-    assigned to teach. Join table (teacher_id, level_id), same shape/
-    reasoning as TeacherBoard — a normal queryable row per assignment,
-    not a Postgres array column.
+    assigned to teach. Join table (teacher_id, level_id) — a normal
+    queryable row per assignment, not a Postgres array column.
     """
     __tablename__ = "teacher_levels"
 

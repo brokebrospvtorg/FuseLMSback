@@ -10,8 +10,8 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_roles, check_license
 from app.core.audit import log_action
 from app.core.notifications import notify
-from app.core.batch_utils import generate_batches
-from app.core.offering_utils import active_boards_for, active_boards_map
+from app.core.batch_utils import generate_batches, format_batch_name, batch_date_range
+from app.core.offering_utils import has_active_offering, active_offering_pairs
 from app.core.security import guard_teacher_assignee_role
 from sqlalchemy import and_, or_
 
@@ -47,9 +47,7 @@ def create_batch(payload: BatchCreate, db: Session = Depends(get_db),
                   current_user: User = Depends(require_roles("admin", "coordinator"))):
     if payload.is_current:
         db.query(Batch).filter(Batch.is_current.is_(True)).update({"is_current": False})
-    data = payload.model_dump()
-    data["board"] = payload.board.value  # BoardEnum -> plain str for the Postgres enum column
-    batch = Batch(**data)
+    batch = Batch(**payload.model_dump())
     db.add(batch)
     db.commit()
     db.refresh(batch)
@@ -90,26 +88,19 @@ def list_batches(
          to the bottom, below every active batch regardless of year, also
          chronological (year ASC, start_date ASC) within that group.
 
-    Deliberately NOT weighted by active_students_count / active_boards —
-    an earlier revision sorted active batches by "how much is happening in
-    them" (most-enrolled first) with year only as a tiebreaker. That
-    produced an order Coordinators found confusing/unpredictable (a
-    newer batch could jump above an older one just because it had more
-    enrollments), and doesn't match this requirement's explicit
-    chronological ordering. active_students_count/assigned_teachers_count/
-    active_boards are still computed and returned on every row (the Batch
-    Summary drawer and per-board "Active" tag both need them) — they're
+    Deliberately NOT weighted by active_students_count — an earlier
+    revision sorted active batches by "how much is happening in them"
+    (most-enrolled first) with year only as a tiebreaker. That produced an
+    order Coordinators found confusing/unpredictable (a newer batch could
+    jump above an older one just because it had more enrollments), and
+    doesn't match this requirement's explicit chronological ordering.
+    active_students_count/assigned_teachers_count are still computed and
+    returned on every row (the Batch Summary drawer needs them) — they're
     just no longer part of the sort key.
 
     This is computed in Python over the already-fetched, already-decorated
     BatchOut list rather than as a SQL ORDER BY, so it stays in one place
     and is trivial to unit test against the BatchOut list directly.
-
-    Every board tab on the frontend (All Batches, British Council, Edexcel,
-    LRN) filters this same already-ordered list rather than re-querying or
-    re-sorting, so all four inherit this exact ordering for free — see
-    admin-batches.component.ts's filteredBatches computed signal, which is
-    a deliberate pass-through of this order, never a re-sort.
     """
     student_counts = dict(
         db.query(Enrollment.batch_id, func.count(distinct(Enrollment.student_id)))
@@ -124,21 +115,6 @@ def list_batches(
         .all()
     )
 
-    # schema_update_15: which Boards each batch currently has ACTIVE
-    # offered-subject rows under — a Batch can span all three at once, so
-    # this is a batch_id -> list[board] map, not a single value. Joined
-    # against Subject so a soft-deleted subject's board doesn't count.
-    active_boards_map: dict = {}
-    board_rows = (
-        db.query(BatchSubject.batch_id, BatchSubject.board)
-        .join(Subject, Subject.id == BatchSubject.subject_id)
-        .filter(BatchSubject.is_active.is_(True), Subject.deleted_at.is_(None))
-        .distinct()
-        .all()
-    )
-    for batch_id, board in board_rows:
-        active_boards_map.setdefault(batch_id, []).append(board)
-
     batches_query = db.query(Batch).filter(Batch.deleted_at.is_(None))
     if active_only:
         batches_query = batches_query.filter(Batch.is_active.is_(True))
@@ -149,7 +125,6 @@ def list_batches(
         out = BatchOut.model_validate(batch)
         out.active_students_count = student_counts.get(batch.id, 0)
         out.assigned_teachers_count = teacher_counts.get(batch.id, 0)
-        out.active_boards = active_boards_map.get(batch.id, [])
         result.append(out)
 
     result.sort(
@@ -192,24 +167,27 @@ def generate_batch_templates(db: Session = Depends(get_db),
 def update_batch(batch_id: uuid.UUID, payload: BatchUpdate, db: Session = Depends(get_db),
                   current_user: User = Depends(require_roles("admin", "coordinator"))):
     """
-    Currently the only editable field is `board` (see BatchUpdate's own
-    docstring for why session/year/dates/is_current/is_active aren't
-    here). Fixes the real gap this endpoint exists to close: batches
-    created before an Admin picked the right board — or that need
-    reassigning later — had no way to change board after creation, which
-    is why every batch could get permanently stuck under one Board tab
-    with no path off it.
+    Corrects a batch's exam session (May/June, Oct/Nov) and/or target year
+    after creation. `board` was removed along with the Board entity; this
+    is what's left. Either field may be omitted to leave it unchanged, but
+    whichever session+year the batch ends up with, name/start_date/end_date
+    are re-derived from that pair via the same Batch Generator utility
+    create_batch uses (see BatchUpdate's docstring), so they can't drift
+    out of sync with it. is_current/is_active are untouched here — use
+    set-current / set-active for those.
     """
     batch = db.query(Batch).filter(Batch.id == batch_id, Batch.deleted_at.is_(None)).first()
     if not batch:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found")
 
-    old_board = batch.board
-    batch.board = payload.board.value
-    log_action(
-        db, current_user.id, "batch_board_updated", "batches", batch.id,
-        {"board": old_board}, {"board": batch.board},
-    )
+    new_session = payload.session if payload.session is not None else batch.session
+    new_year = payload.year if payload.year is not None else batch.year
+
+    batch.session = new_session
+    batch.year = new_year
+    batch.name = format_batch_name(new_session, new_year)
+    batch.start_date, batch.end_date = batch_date_range(new_session, new_year)
+
     db.commit()
     db.refresh(batch)
     return batch
@@ -254,7 +232,7 @@ def set_batch_active(batch_id: uuid.UUID, is_active: bool, db: Session = Depends
 # shows up as requestable until Admin has explicitly offered it.
 # ---------------------------------------------------------------------------
 @router.get("/batches/{batch_id}/offered-subjects", response_model=List[BatchSubjectOut])
-def list_offered_subjects(batch_id: uuid.UUID, board: Optional[str] = None,
+def list_offered_subjects(batch_id: uuid.UUID,
                            db: Session = Depends(get_db),
                            current_user: User = Depends(get_current_user)):
     """
@@ -266,11 +244,9 @@ def list_offered_subjects(batch_id: uuid.UUID, board: Optional[str] = None,
     just this response diffed against GET /subjects?level_id= on the
     frontend — no separate "list inactive too" endpoint needed.
 
-    schema_update_15: optional `board` query param narrows to offerings
-    under one examining Board — the same batch can have the same subject
-    offered under more than one board, so callers that care about a
-    specific Board Tab (admin-batches.component.ts) should pass this
-    rather than filtering the unfiltered list client-side.
+    Board removed: offerings are keyed on plain (batch_id, subject_id) —
+    a subject is either offered for this batch or it isn't, with no
+    per-board narrowing.
     """
     batch = db.query(Batch).filter(Batch.id == batch_id, Batch.deleted_at.is_(None)).first()
     if not batch:
@@ -301,15 +277,13 @@ def list_offered_subjects(batch_id: uuid.UUID, board: Optional[str] = None,
             Subject.deleted_at.is_(None),
         )
     )
-    if board:
-        query = query.filter(BatchSubject.board == board)
 
     rows = query.order_by(Level.display_order, Subject.name).all()
     return [
         BatchSubjectOut(
             subject_id=bs.subject_id, subject_name=subject_name,
             level_id=level_id, level_name=level_name,
-            board=bs.board, is_active=bs.is_active,
+            is_active=bs.is_active,
         )
         for bs, subject_name, level_id, level_name in rows
     ]
@@ -319,16 +293,14 @@ def list_offered_subjects(batch_id: uuid.UUID, board: Optional[str] = None,
 def offer_subjects_for_batch(batch_id: uuid.UUID, payload: OfferSubjectsPayload, db: Session = Depends(get_db),
                               current_user: User = Depends(require_roles("admin", "coordinator"))):
     """
-    Upserts a batch_subjects row per (subject_id, board) — activating (or,
-    with is_active=False, deactivating) it for this batch. Same endpoint
+    Upserts a batch_subjects row per subject_id — activating (or, with
+    is_active=False, deactivating) it for this batch. Same endpoint
     handles both directions of the Admin Batches screen's
     "activate/deactivate subjects per batch" toggle (spec section 4)
     rather than needing a separate deactivate/DELETE route.
 
-    schema_update_15: upsert key is now (batch_id, subject_id, board), not
-    just (batch_id, subject_id) — a Batch can have the same subject offered
-    under multiple Boards simultaneously, so board is part of the payload
-    and part of what identifies "the same offering" on a repeat call.
+    Board removed: upsert key is plain (batch_id, subject_id) — a subject
+    is offered for a batch or it isn't, with no per-board duplication.
     """
     batch = db.query(Batch).filter(Batch.id == batch_id, Batch.deleted_at.is_(None)).first()
     if not batch:
@@ -346,12 +318,10 @@ def offer_subjects_for_batch(batch_id: uuid.UUID, payload: OfferSubjectsPayload,
             detail=f"Subject(s) not found: {sorted(str(i) for i in invalid_subject_ids)}",
         )
 
-    board_value = payload.board.value
     existing_by_subject = {
         row.subject_id: row for row in db.query(BatchSubject).filter(
             BatchSubject.batch_id == batch_id,
             BatchSubject.subject_id.in_(payload.subject_ids),
-            BatchSubject.board == board_value,
         ).all()
     }
     for subject_id in payload.subject_ids:
@@ -360,14 +330,13 @@ def offer_subjects_for_batch(batch_id: uuid.UUID, payload: OfferSubjectsPayload,
             existing.is_active = payload.is_active
         else:
             db.add(BatchSubject(
-                batch_id=batch_id, subject_id=subject_id,
-                board=board_value, is_active=payload.is_active,
+                batch_id=batch_id, subject_id=subject_id, is_active=payload.is_active,
             ))
 
     log_action(
         db, current_user.id, "batch_subjects_offered" if payload.is_active else "batch_subjects_withdrawn",
         "batch_subjects", batch_id, None,
-        {"subject_ids": [str(i) for i in payload.subject_ids], "board": board_value, "is_active": payload.is_active},
+        {"subject_ids": [str(i) for i in payload.subject_ids], "is_active": payload.is_active},
     )
     db.commit()
 
@@ -391,7 +360,7 @@ def offer_subjects_for_batch(batch_id: uuid.UUID, payload: OfferSubjectsPayload,
     return [
         BatchSubjectOut(subject_id=bs.subject_id, subject_name=subject_name,
                          level_id=level_id, level_name=level_name,
-                         board=bs.board, is_active=bs.is_active)
+                         is_active=bs.is_active)
         for bs, subject_name, level_id, level_name in rows
     ]
 
@@ -460,12 +429,11 @@ def assign_teacher_to_batch(batch_id: uuid.UUID, payload: AssignTeacherToBatchPa
     # the "batch-scoped convenience wrapper" this endpoint's own docstring
     # describes, so it needs the exact same check: no assigning a teacher
     # into a batch/subject combo with no active offering.
-    boards = active_boards_for(db, batch_id, payload.subject_id)
-    if not boards:
+    if not has_active_offering(db, batch_id, payload.subject_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This subject has no active offering for this batch. Offer the subject for this "
-                   "batch (and board) before assigning a teacher to it.",
+                   "batch before assigning a teacher to it.",
         )
 
     assignment = TeacherSubjectAssignment(
@@ -481,7 +449,6 @@ def assign_teacher_to_batch(batch_id: uuid.UUID, payload: AssignTeacherToBatchPa
     return TeacherSubjectAssignmentOut(
         id=assignment.id, teacher_id=assignment.teacher_id, subject_id=assignment.subject_id,
         batch_id=assignment.batch_id, assigned_by=assignment.assigned_by, assigned_at=assignment.assigned_at,
-        board=sorted(boards)[0],
     )
 
 
@@ -571,7 +538,7 @@ def list_subjects(level_id: Optional[uuid.UUID] = None, include_inactive: bool =
 
     return [
         SubjectOut(
-            id=subject.id, name=subject.name, code=subject.code, board=subject.board,
+            id=subject.id, name=subject.name, code=subject.code,
             is_active=subject.is_active, level_id=subject.level_id, level_name=level_name,
             levels=levels_by_subject.get(subject.id, []),
         )
@@ -625,7 +592,7 @@ def create_subject(payload: SubjectCreate, db: Session = Depends(get_db),
     primary_level_id = ordered_level_ids[0]
 
     subject = Subject(
-        name=payload.name, code=payload.code, board=payload.board.value,
+        name=payload.name, code=payload.code,
         level_id=primary_level_id, is_active=True,
     )
     db.add(subject)
@@ -636,7 +603,7 @@ def create_subject(payload: SubjectCreate, db: Session = Depends(get_db),
 
     log_action(
         db, current_user.id, "subject_created", "subjects", subject.id, None,
-        {"name": payload.name, "code": payload.code, "board": payload.board.value,
+        {"name": payload.name, "code": payload.code,
          "level_ids": [str(i) for i in ordered_level_ids]},
     )
     db.commit()
@@ -646,7 +613,7 @@ def create_subject(payload: SubjectCreate, db: Session = Depends(get_db),
     levels_out.sort(key=lambda lvl: lvl.display_order)
     level_name = next((level.name for level in valid_levels if level.id == primary_level_id), None)
     return SubjectOut(
-        id=subject.id, name=subject.name, code=subject.code, board=subject.board,
+        id=subject.id, name=subject.name, code=subject.code,
         is_active=subject.is_active, level_id=subject.level_id, level_name=level_name,
         levels=levels_out,
     )
@@ -861,14 +828,13 @@ def assign_teacher(payload: TeacherSubjectAssignmentCreate, db: Session = Depend
     # A Teacher must never be assignable to a subject+batch combo that
     # isn't an actual active offering (BatchSubject) — otherwise this
     # assignment shows up verbatim in every Teacher-scoped cascading
-    # dropdown (Marks entry's Batch -> Board -> Level -> Subject picker)
-    # for a batch/subject the Admin never really offered, or withdrew.
-    boards = active_boards_for(db, payload.batch_id, payload.subject_id)
-    if not boards:
+    # dropdown (Marks entry's Batch -> Level -> Subject picker) for a
+    # batch/subject the Admin never really offered, or withdrew.
+    if not has_active_offering(db, payload.batch_id, payload.subject_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This subject has no active offering for this batch. Offer the subject for this "
-                   "batch (and board) before assigning a teacher to it.",
+                   "batch before assigning a teacher to it.",
         )
 
     assignment = TeacherSubjectAssignment(assigned_by=current_user.id, **payload.model_dump())
@@ -878,7 +844,6 @@ def assign_teacher(payload: TeacherSubjectAssignmentCreate, db: Session = Depend
     return TeacherSubjectAssignmentOut(
         id=assignment.id, teacher_id=assignment.teacher_id, subject_id=assignment.subject_id,
         batch_id=assignment.batch_id, assigned_by=assignment.assigned_by, assigned_at=assignment.assigned_at,
-        board=sorted(boards)[0],
     )
 
 
@@ -902,13 +867,12 @@ def list_teacher_assignments(
     offering for that batch withdrawn (BatchSubject.is_active=False) or
     never created at all (pre-existing data / assignments made before this
     fix's validation went in on the write side). Every row returned here
-    is now cross-checked against an ACTUAL active offering, and fanned out
-    one row per active board that offering is under — this is what lets
-    the Teacher Portal's Batch -> Board -> Level -> Subject cascade (Marks
-    entry) show only boards genuinely active for that batch/subject
-    combo, instead of inferring board from the catalog Subject's own
-    `board` (which can be "All", and previously made every board show up
-    regardless of what's actually offered here).
+    is now cross-checked against an ACTUAL active offering (Board removed,
+    so this is a plain active/inactive check, no more per-board fan-out)
+    — this is what lets the Teacher Portal's Batch -> Level -> Subject
+    cascade (Marks entry) show only assignments genuinely backed by an
+    active offering, instead of every raw assignment row regardless of
+    whether it's still actually offered.
     """
     query = (
         db.query(TeacherSubjectAssignment)
@@ -932,16 +896,16 @@ def list_teacher_assignments(
         query = query.filter(TeacherSubjectAssignment.batch_id == batch_id)
     assignments = query.all()
 
-    boards_by_pair = active_boards_map(db, ((a.batch_id, a.subject_id) for a in assignments))
+    active_pairs = active_offering_pairs(db, ((a.batch_id, a.subject_id) for a in assignments))
 
-    result: List[TeacherSubjectAssignmentOut] = []
-    for a in assignments:
-        for board in boards_by_pair.get((a.batch_id, a.subject_id), []):
-            result.append(TeacherSubjectAssignmentOut(
-                id=a.id, teacher_id=a.teacher_id, subject_id=a.subject_id, batch_id=a.batch_id,
-                assigned_by=a.assigned_by, assigned_at=a.assigned_at, board=board,
-            ))
-    return result
+    return [
+        TeacherSubjectAssignmentOut(
+            id=a.id, teacher_id=a.teacher_id, subject_id=a.subject_id, batch_id=a.batch_id,
+            assigned_by=a.assigned_by, assigned_at=a.assigned_at,
+        )
+        for a in assignments
+        if (a.batch_id, a.subject_id) in active_pairs
+    ]
 
 
 @router.get("/teacher-assignments/registry", response_model=List[TeacherAssignmentRegistryOut])

@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from app.core.batch_utils import (
     BATCH_SESSIONS, DEFAULT_YEARS_AHEAD, batch_date_range, format_batch_name,
 )
-from app.schemas.common import ApprovalStatus, BatchSession, BoardEnum
+from app.schemas.common import ApprovalStatus, BatchSession
 
 
 class BatchCreate(BaseModel):
@@ -32,9 +32,6 @@ class BatchCreate(BaseModel):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     is_current: bool = False
-    # schema_update_11: required — every Batch is run under exactly one
-    # examining board.
-    board: BoardEnum
 
     @model_validator(mode="after")
     def _validate_against_generator(self) -> "BatchCreate":
@@ -71,17 +68,36 @@ class BatchCreate(BaseModel):
 
 class BatchUpdate(BaseModel):
     """
-    PUT /api/academic/batches/{batch_id}. Deliberately narrower than
-    BatchCreate: session/year/name/dates are what the Batch Generator
-    derives a batch's identity from (see BatchCreate's own docstring) and
-    aren't editable here — only `board` is, since that's the one field an
-    Admin can get wrong at creation time (or that needs reassigning later)
-    with no generator-driven derivation to re-validate against. is_current
-    and is_active already have their own dedicated endpoints
-    (set-current / set-active) and stay out of this payload so this one
-    endpoint has a single, unambiguous purpose.
+    PUT /api/academic/batches/{batch_id}. Previously also carried `board`
+    (Admin correcting the examining board at creation time) — that field is
+    gone along with the Board entity. What's left, and what this endpoint
+    is actually for, is correcting a batch's exam session (May/June vs
+    Oct/Nov) and/or its target year after creation.
+
+    Both fields are optional so a caller can patch just one of them; the
+    router re-derives name/start_date/end_date from the resulting
+    session+year via the same Batch Generator utility BatchCreate uses, so
+    those never drift out of sync with session/year. is_current/is_active
+    have their own dedicated endpoints (set-current / set-active) and
+    aren't touched here.
     """
-    board: BoardEnum
+    session: Optional[BatchSession] = None
+    year: Optional[int] = None
+
+    @model_validator(mode="after")
+    def _validate_against_generator(self) -> "BatchUpdate":
+        if self.session is not None and self.session not in BATCH_SESSIONS:
+            raise ValueError(f"session must be one of {BATCH_SESSIONS}")
+
+        if self.year is not None:
+            current_year = date.today().year
+            if not (current_year <= self.year <= current_year + DEFAULT_YEARS_AHEAD):
+                raise ValueError(
+                    f"year must be between {current_year} and {current_year + DEFAULT_YEARS_AHEAD} "
+                    "(the standard Batch Generator window)"
+                )
+
+        return self
 
 
 class BatchOut(BaseModel):
@@ -92,7 +108,6 @@ class BatchOut(BaseModel):
     start_date: date
     end_date: date
     is_current: bool
-    board: BoardEnum
     # schema_update_13: "is this batch open for admin work" — see
     # Batch.is_active in models/academic.py for how this differs from
     # is_current above. Defaults true so a bare Batch row (e.g. right after
@@ -106,14 +121,6 @@ class BatchOut(BaseModel):
     # these first.
     active_students_count: int = 0
     assigned_teachers_count: int = 0
-    # schema_update_15: distinct Boards (British Council / Edexcel / LRN)
-    # that currently have at least one active BatchSubject offering in
-    # this batch. Populated by list_batches via a grouped subquery, same
-    # pattern as active_students_count/assigned_teachers_count above — NOT
-    # derived from the single Batch.board column, which no longer
-    # represents "the" board this batch runs under. Empty list is normal
-    # and expected for a batch that hasn't had any subjects offered yet.
-    active_boards: list[BoardEnum] = []
 
     class Config:
         from_attributes = True
@@ -144,14 +151,13 @@ class LevelOut(BaseModel):
 
 
 class SubjectOut(BaseModel):
-    """schema_update_16: `code`, `board`, and `levels` (the full multi-level
-    mapping via subject_levels) restored/added. `level_id`/`level_name`
-    kept as-is for existing consumers that still key off the single
-    primary level (offered-subjects, teacher assignment, enrollment)."""
+    """schema_update_16: `code` and `levels` (the full multi-level mapping
+    via subject_levels) restored/added. `level_id`/`level_name` kept as-is
+    for existing consumers that still key off the single primary level
+    (offered-subjects, teacher assignment, enrollment)."""
     id: uuid.UUID
     name: str
     code: str
-    board: BoardEnum
     is_active: bool
     level_id: uuid.UUID
     # Joined in by the router for display convenience — not a real column.
@@ -169,7 +175,6 @@ class SubjectCreate(BaseModel):
     create-subject endpoint schema_update_11 deliberately removed)."""
     name: str = Field(..., min_length=1, max_length=200)
     code: str = Field(..., min_length=1, max_length=50)
-    board: BoardEnum
     level_ids: List[uuid.UUID] = Field(..., min_length=1)
 
     @field_validator("name", "code")
@@ -197,9 +202,9 @@ class SubjectCreate(BaseModel):
 class SubjectUpdate(BaseModel):
     """PUT /api/academic/subjects/{id} — Admin Subjects module. Deliberately
     narrower than SubjectCreate: only name/code are editable here (matches
-    the task's "Edit Subject Name/Code" scope). Board and Level mapping are
-    catalog-structural decisions made at creation time and aren't exposed
-    on this screen — changing them would silently reshape which batches/
+    the task's "Edit Subject Name/Code" scope). Level mapping is a
+    catalog-structural decision made at creation time and isn't exposed on
+    this screen — changing it would silently reshape which batches/
     offerings/enrollments this subject applies to, which belongs in a
     separate, more deliberate flow if it's ever needed."""
     name: str = Field(..., min_length=1, max_length=200)
@@ -349,14 +354,14 @@ class OfferSubjectsPayload(BaseModel):
     screen's deactivate action — no separate DELETE/deactivate endpoint
     needed for what's really the same upsert either way.
 
-    schema_update_15: `board` is now required — a batch_subjects row is an
-    offering of a subject under a specific examining Board, not just under
-    a batch. The same subject_id can be offered more than once for the
-    same batch as long as each call uses a different board (e.g. offer
-    Physics under both British Council and Edexcel for the same batch).
+    board removal: a batch_subjects row used to be an offering of a
+    subject under a specific examining Board, and the same subject_id
+    could be offered more than once for the same batch (once per board).
+    Uniqueness is now plain (batch_id, subject_id) — offering the same
+    subject twice for a batch is a no-op/conflict rather than a second
+    board-scoped row.
     """
     subject_ids: list[uuid.UUID]
-    board: BoardEnum
     is_active: bool = True
 
 
@@ -367,7 +372,6 @@ class BatchSubjectOut(BaseModel):
     subject_name: str
     level_id: uuid.UUID
     level_name: str
-    board: BoardEnum
     is_active: bool
 
 
@@ -378,14 +382,6 @@ class TeacherSubjectAssignmentOut(BaseModel):
     batch_id: uuid.UUID
     assigned_by: uuid.UUID
     assigned_at: datetime
-    # Over-Inclusive Cascading Dropdowns fix: the active BatchSubject board
-    # this assignment is actually usable under, resolved server-side from
-    # batch_subjects (never inferred from the catalog Subject's own board,
-    # which can be "All"). GET /teacher-assignments fans one assignment
-    # row out into one row per active board; POST responses pick the
-    # (deterministic) first active board at creation time. Always a
-    # concrete board (British Council / Edexcel / LRN), never "All".
-    board: BoardEnum
 
     class Config:
         from_attributes = True
@@ -457,7 +453,6 @@ class BatchSummarySubjectOut(BaseModel):
 class BatchSummaryOut(BaseModel):
     batch_id: uuid.UUID
     batch_name: str
-    board: BoardEnum
     is_current: bool
     total_active_students: int
     total_assigned_teachers: int

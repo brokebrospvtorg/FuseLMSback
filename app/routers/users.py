@@ -18,7 +18,7 @@ from app.core.audit import log_action
 from app.models import (
     User, StudentProfile, TeacherProfile, ParentProfile, ParentStudentLink,
     VerificationToken, CorrectionRequest, StudentLevelEnrollment, Level,
-    Subject, Enrollment, Batch, TeacherBoard, TeacherLevel,
+    Subject, Enrollment, Batch, TeacherLevel,
     TeacherSubjectAssignment, TimetableSlot,
 )
 from app.schemas.user import (
@@ -343,9 +343,6 @@ def create_user(
                     nationality=payload.nationality,
                     cnic=payload.cnic,
                     registration_id=payload.registration_id,
-                    # UserCreate's model_validator already guarantees board
-                    # is set when role == "student".
-                    board=payload.board.value,
                 ))
                 db.flush()
                 savepoint.commit()
@@ -413,10 +410,6 @@ def create_user(
                         status_code=status.HTTP_409_CONFLICT,
                         detail="Could not generate a unique Teacher Code — please retry.",
                     )
-        # UserCreate's model_validator already guarantees at least one
-        # board is set when role == "teacher".
-        for board in payload.boards:
-            db.add(TeacherBoard(teacher_id=user.id, board=board.value))
         # UserCreate's model_validator already guarantees at least one
         # level is set when role == "teacher".
         for level_id in payload.level_ids:
@@ -527,11 +520,15 @@ def get_user(
         # on top of UserOut's scalar columns, and with from_attributes=True
         # Pydantic eagerly resolves EVERY field via getattr(user, ...) —
         # including `user.teacher_profile`, a live SQLAlchemy relationship.
-        # It then recurses into TeacherProfileOut, which does the same for
-        # `teacher_profile.boards` — a relationship returning raw
-        # TeacherBoard ROW objects, not BoardEnum values — and blows up
-        # trying to coerce a TeacherBoard instance into a BoardEnum member.
-        # That crash happens right here, before the role-specific blocks
+        # It then recurses into TeacherProfileOut, which used to do the
+        # same for `teacher_profile.boards` before Board was removed. The
+        # underlying failure mode this comment originally described (a raw
+        # relationship object failing to coerce into a Pydantic enum field)
+        # can recur for any future relationship-backed field added to
+        # TeacherProfileOut, which is why this block still builds the
+        # profile explicitly below rather than via a blanket
+        # model_validate(). That crash happens right here, before the
+        # role-specific blocks
         # below (which build each profile correctly from a targeted query)
         # ever get a chance to run and overwrite it.
         #
@@ -551,25 +548,17 @@ def get_user(
         elif user.role == "teacher":
             tp = db.query(TeacherProfile).filter(TeacherProfile.user_id == user.id).first()
             if tp:
-                # Ensure we extract the string/enum value from TeacherBoard objects or use direct string values
-                raw_boards = db.query(TeacherBoard).filter(TeacherBoard.teacher_id == user.id).all()
-                boards_list = []
-                for tb in raw_boards:
-                    val = tb.board.value if hasattr(tb.board, "value") else tb.board
-                    boards_list.append(val)
-
                 levels_list = [
                     tl.level_id for tl in
                     db.query(TeacherLevel).filter(TeacherLevel.teacher_id == user.id).all()
                 ]
-                
+
                 detail.teacher_profile = TeacherProfileOut(
                     user_id=tp.user_id,
                     hire_date=tp.hire_date,
                     gender=tp.gender,
                     cnic=tp.cnic,
                     teacher_code=tp.teacher_code,
-                    boards=boards_list,
                     level_ids=levels_list
                 )
                 
@@ -699,8 +688,7 @@ def update_user(
         if sp:
             # Read-Only Reg ID & Roll Number: roll_number and registration_id
             # are deliberately excluded from this loop — both are
-            # server-generated at account creation (_next_roll_number /
-            # the caller-supplied exam-board id captured once, at
+            # server-generated at account creation (_next_roll_number, at
             # creation-time only) and are no longer writable through the
             # Edit Details PATCH, matching the frontend's [readonly]
             # treatment of both fields. UserUpdate still accepts them on
@@ -713,8 +701,6 @@ def update_user(
                 value = getattr(payload, field)
                 if value is not None:
                     setattr(sp, field, value)
-            if payload.board is not None:
-                sp.board = payload.board.value
     elif user.role == "teacher":
         tp = db.query(TeacherProfile).filter(TeacherProfile.user_id == user.id).first()
         if tp:
@@ -722,14 +708,9 @@ def update_user(
                 value = getattr(payload, field)
                 if value is not None:
                     setattr(tp, field, value)
-            if payload.boards is not None:
-                # Full replacement, same convention as subject_ids below —
-                # UserUpdate's validator already rejects an empty list, so
-                # this only ever runs with >=1 board.
-                db.query(TeacherBoard).filter(TeacherBoard.teacher_id == user.id).delete()
-                for board in payload.boards:
-                    db.add(TeacherBoard(teacher_id=user.id, board=board.value))
-            # ADD: level_ids full-replacement, same pattern as boards above.
+            # level_ids full-replacement, same convention as subject_ids
+            # elsewhere — UserUpdate's validator already rejects an empty
+            # list, so this only ever runs with >=1 level.
             if payload.level_ids is not None:
                 db.query(TeacherLevel).filter(TeacherLevel.teacher_id == user.id).delete()
                 for level_id in payload.level_ids:
@@ -928,12 +909,11 @@ def soft_delete_user(
             )
             .update({TimetableSlot.deleted_at: now}, synchronize_session=False)
         )
-        # TeacherBoard / TeacherLevel carry no deleted_at column (they're
-        # pure qualification join rows, same convention noted on
+        # TeacherLevel carries no deleted_at column (it's a pure
+        # qualification join row, same convention noted on
         # TeacherWorkloadSummary) — hard-deleted here, same
         # full-replacement pattern already used for a Teacher's role
-        # switch above (db.query(TeacherBoard)...delete()).
-        db.query(TeacherBoard).filter(TeacherBoard.teacher_id == user.id).delete(synchronize_session=False)
+        # switch above.
         db.query(TeacherLevel).filter(TeacherLevel.teacher_id == user.id).delete(synchronize_session=False)
 
         log_action(db, current_user.id, "teacher_cascade_deactivated", "users", user.id, None, {

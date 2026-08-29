@@ -6,8 +6,8 @@ from typing import Literal
 # Reusable Literal types for request/input schemas.
 #
 # These mirror the corresponding Postgres ENUM types in app/models/enums.py
-# — kept as plain typing.Literal (not str/Enum classes like BoardEnum below)
-# to match the existing AttendanceStatusInput convention in
+# — kept as plain typing.Literal (not str/Enum classes) to match the
+# existing AttendanceStatusInput convention in
 # app/schemas/attendance.py. Using these instead of a bare `str` on INPUT
 # schemas means FastAPI/Pydantic rejects an invalid value with a clean 422
 # at the API boundary, instead of it reaching business logic and only
@@ -27,22 +27,6 @@ UserStatus = Literal["pending", "active", "suspended"]
 BatchSession = Literal["may_june", "oct_nov"]
 Role = Literal["admin", "coordinator", "teacher", "student", "parent"]
 
-
-class BoardEnum(str, Enum):
-    """
-    Mirrors the `board` Postgres enum (schema_update_11) and the frontend's
-    Board enum (src/app/core/models/enums.ts) — keep all three in sync by
-    hand, same convention as every other enum in this project (see the note
-    atop app/models/enums.py). Used by Student registration/edit (single,
-    required), Teacher registration/edit (one or more), and Batch
-    creation/edit (single).
-    """
-    BRITISH_COUNCIL = "British Council"
-    EDEXCEL = "Edexcel"
-    LRN = "LRN"
-    # schema_update_16: catalog Subjects only (POST /api/academic/subjects)
-    # — not offered on Student/Teacher/Batch forms.
-    ALL = "All"
 
 class GenderEnum(str, Enum):
     MALE = "Male"

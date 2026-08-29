@@ -87,19 +87,7 @@ ClassLevel = PGEnum(
     name="class_level", create_type=False,
 )
 
-# Exam Board — schema_update_11. Fixed 3-value global catalog used by
-# Students (single board they're registered under), Teachers (one or more
-# boards they're qualified to teach), and Batches (the board the batch is
-# run under). Kept as its own enum (not folded into ClassLevel or Level)
-# since board and academic level are orthogonal — a Student/Teacher/Batch
-# picks exactly one axis of "O Level vs A Level" (via Level/Subject.level)
-# and independently one-or-more of "which examining board".
-Board = PGEnum(
-    # schema_update_16: 'All' added for catalog Subjects that run under
-    # every examining board (POST /api/academic/subjects). Deliberately
-    # NOT offered as a choice on Student/Teacher/Batch board dropdowns —
-    # those forms' own option lists are unchanged; this only widens what
-    # the shared Postgres type accepts.
-    "British Council", "Edexcel", "LRN", "All",
-    name="board", create_type=False,
-)
+# NOTE: the `board` enum (schema_update_11 / schema_update_16) has been
+# removed along with the Board entity — Student/Teacher/Batch/Subject no
+# longer carry an examining-board axis. See the board-removal migration
+# for the corresponding `DROP TYPE board`.

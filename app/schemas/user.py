@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 from typing import Optional, List, Literal
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
-from app.schemas.common import BoardEnum, GenderEnum, ReligionEnum, NationalityEnum, UserStatus, validate_password_strength
+from app.schemas.common import GenderEnum, ReligionEnum, NationalityEnum, UserStatus, validate_password_strength
 
 
 class UserCreate(BaseModel):
@@ -24,9 +24,7 @@ class UserCreate(BaseModel):
         description="Pakistani CNIC format: XXXXX-XXXXXXX-X",
     )
     registration_id: Optional[str] = None  # Added back to prevent frontend mismatch errors
-    board: Optional[BoardEnum] = None
     hire_date: Optional[date] = None
-    boards: Optional[List[BoardEnum]] = None
     level_ids: Optional[List[uuid.UUID]] = None
     parent_link_mode: Optional[Literal["existing", "later"]] = None
     parent_id: Optional[uuid.UUID] = None
@@ -58,11 +56,7 @@ class UserCreate(BaseModel):
         return list(seen.keys())
 
     @model_validator(mode="after")
-    def _require_board_for_role(self) -> "UserCreate":
-        if self.role == "student" and self.board is None:
-            raise ValueError("board is required when creating a student")
-        if self.role == "teacher" and not self.boards:
-            raise ValueError("boards must include at least one board when creating a teacher")
+    def _require_level_ids_for_teacher(self) -> "UserCreate":
         if self.role == "teacher" and not self.level_ids:
             raise ValueError("level_ids must include at least one level when creating a teacher")
         return self
@@ -86,11 +80,9 @@ class UserUpdate(BaseModel):
         default=None, pattern=r"^\d{5}-\d{7}-\d{1}$",
     )
     registration_id: Optional[str] = None  
-    board: Optional[BoardEnum] = None
     designation: Optional[str] = None  
     hire_date: Optional[date] = None
     teacher_code: Optional[str] = None
-    boards: Optional[List[BoardEnum]] = None
     level_ids: Optional[List[uuid.UUID]] = None
     level_id: Optional[uuid.UUID] = None  
     batch_id: Optional[uuid.UUID] = None
@@ -105,17 +97,6 @@ class UserUpdate(BaseModel):
         for level_id in v or []:
             seen.setdefault(level_id, None)
         return list(seen.keys()) if v is not None else v
-
-    @field_validator("boards")
-    @classmethod
-    def _boards_not_empty_when_provided(cls, v: Optional[List[BoardEnum]]) -> Optional[List[BoardEnum]]:
-        if v is not None and len(v) == 0:
-            raise ValueError("boards cannot be empty — a teacher must be qualified for at least one board")
-        seen: dict[BoardEnum, None] = {}
-        for board in v or []:
-            seen.setdefault(board, None)
-        return list(seen.keys()) if v is not None else v
-
 
 class UserOut(BaseModel):
     id: uuid.UUID
@@ -144,7 +125,6 @@ class StudentProfileOut(BaseModel):
     nationality: Optional[NationalityEnum] = None
     cnic: Optional[str] = None
     registration_id: Optional[str] = None
-    board: BoardEnum
 
     class Config:
         from_attributes = True
@@ -156,7 +136,6 @@ class TeacherProfileOut(BaseModel):
     gender: Optional[str] = None
     cnic: Optional[str] = None
     teacher_code: Optional[str] = None
-    boards: List[BoardEnum] = []
     level_ids: List[uuid.UUID] = []
 
     class Config:

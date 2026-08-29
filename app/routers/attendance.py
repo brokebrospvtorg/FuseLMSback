@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session, aliased
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_roles, check_license
-from app.core.offering_utils import active_boards_map
+from app.core.offering_utils import active_offering_pairs
 from app.core.audit import log_action
 from app.core.notifications import notify
 from app.core.attendance_utils import upsert_attendance_record, try_auto_mark_present
@@ -23,7 +23,6 @@ from app.schemas.attendance import (
     TeacherAttendanceLogEntry,
     AdminTeacherAttendanceEntry, AdminTeacherAttendanceMarkRequest,
 )
-from app.schemas.common import BoardEnum
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"], dependencies=[Depends(check_license)])
 
@@ -32,8 +31,8 @@ class CoordinatorDayWiseEntry(BaseModel):
     """
     One row per period, for the Day-Wise Attendance View that replaces the
     old full-calendar Coordinator Attendance UI. Returned by the cascade
-    endpoint below (Batch -> Board -> Level -> Subject -> Period/Date) so
-    the Coordinator can pick a period and jump into
+    endpoint below (Batch -> Level -> Subject -> Period/Date; Board removed)
+    so the Coordinator can pick a period and jump into
     GET/POST /api/attendance/coordinator/roster + /override-students for
     that exact timetable_slot_id + date.
     """
@@ -42,7 +41,6 @@ class CoordinatorDayWiseEntry(BaseModel):
     end_time: time
     batch_id: uuid.UUID
     batch_name: str
-    board: str
     level_id: uuid.UUID
     level_code: Optional[str] = None
     subject_id: uuid.UUID
@@ -61,7 +59,6 @@ class CoordinatorDayWiseEntry(BaseModel):
 def coordinator_day_wise_attendance(
     date: date_type,
     batch_id: uuid.UUID,
-    board: Optional[BoardEnum] = None,
     level_id: Optional[uuid.UUID] = None,
     subject_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_db),
@@ -70,14 +67,15 @@ def coordinator_day_wise_attendance(
     """
     Day-Wise Attendance View (no calendar). `date` + `batch_id` are always
     required — nothing renders before a Batch and a day are picked, same
-    as the frontend's cascade. `board`, `level_id`, `subject_id`
-    progressively narrow that same day's periods, in that exact order:
-    Batch -> Board -> Level -> Subject -> Period/Date.
+    as the frontend's cascade. `level_id`, `subject_id` progressively
+    narrow that same day's periods, in that order: Batch -> Level ->
+    Subject -> Period/Date. (Board was previously an extra step between
+    Batch and Level; it's been removed along with the Board entity.)
 
-    board isn't a TimetableSlot column (it's a batch_subjects concept —
-    see BatchSubject's own docstring), so it's resolved and filtered via
-    the same active-offering lookup the Teacher-side timetable cascade
-    already uses (active_boards_map), not a direct column filter.
+    A slot's batch+subject still has to have an active offering
+    (BatchSubject) — see has_active_offering's docstring — so this still
+    checks that via the same active-offering lookup the Teacher-side
+    timetable cascade uses, just without the board fan-out.
 
     Each row is one period on that day for the matching filters, with the
     student attendance already recorded against it for `date` (zeros +
@@ -111,7 +109,7 @@ def coordinator_day_wise_attendance(
     if not rows:
         return []
 
-    boards_by_pair = active_boards_map(db, ((slot.batch_id, slot.subject_id) for slot, *_ in rows))
+    active_pairs = active_offering_pairs(db, ((slot.batch_id, slot.subject_id) for slot, *_ in rows))
 
     slot_ids = [slot.id for slot, *_ in rows]
     count_rows = (
@@ -141,11 +139,8 @@ def coordinator_day_wise_attendance(
 
     result: List[CoordinatorDayWiseEntry] = []
     for slot, subject_name, level_code, teacher_name, batch_name in rows:
-        boards = boards_by_pair.get((slot.batch_id, slot.subject_id), [])
-        if not boards:
+        if (slot.batch_id, slot.subject_id) not in active_pairs:
             continue  # no active offering left for this slot's batch+subject
-        if board and board.value not in boards:
-            continue
         c = counts_by_slot.get(slot.id)
         result.append(CoordinatorDayWiseEntry(
             timetable_slot_id=slot.id,
@@ -153,7 +148,6 @@ def coordinator_day_wise_attendance(
             end_time=slot.end_time,
             batch_id=slot.batch_id,
             batch_name=batch_name,
-            board=board.value if board else sorted(boards)[0],
             level_id=slot.level_id,
             level_code=level_code,
             subject_id=slot.subject_id,
@@ -600,7 +594,6 @@ def coordinator_mark_or_override_teacher(
 def admin_teacher_attendance_cascade(
     date: date_type,
     batch_id: uuid.UUID,
-    board: Optional[BoardEnum] = None,
     level_id: Optional[uuid.UUID] = None,
     subject_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_db),
@@ -609,11 +602,12 @@ def admin_teacher_attendance_cascade(
     """
     Admin Teacher Attendance — View & Edit (full parity with the
     Coordinator's Day-Wise view, see GET /coordinator/day-wise, whose
-    cascade/board-resolution rules this mirrors exactly). Cascading
-    Selection: `batch_id` + `date` are always required — nothing renders
-    before a Batch and a day are picked; `board`, `level_id`, `subject_id`
-    progressively narrow that same day's periods in the enforced order
-    Batch -> Board -> Level -> Subject.
+    cascade rules this mirrors exactly). Cascading Selection: `batch_id` +
+    `date` are always required — nothing renders before a Batch and a day
+    are picked; `level_id`, `subject_id` progressively narrow that same
+    day's periods in the enforced order Batch -> Level -> Subject. (Board
+    was previously an extra step between Batch and Level; it's been
+    removed along with the Board entity.)
 
     One row per period on `date` matching the filters, with the assigned
     teacher's OWN attendance status for that period+date (None if never
@@ -645,7 +639,7 @@ def admin_teacher_attendance_cascade(
     if not rows:
         return []
 
-    boards_by_pair = active_boards_map(db, ((slot.batch_id, slot.subject_id) for slot, *_ in rows))
+    active_pairs = active_offering_pairs(db, ((slot.batch_id, slot.subject_id) for slot, *_ in rows))
 
     slot_ids = [slot.id for slot, *_ in rows]
     teacher_id_by_slot = {slot.id: slot.teacher_id for slot, *_ in rows}
@@ -667,11 +661,8 @@ def admin_teacher_attendance_cascade(
 
     result: List[AdminTeacherAttendanceEntry] = []
     for slot, subject_name, level_code, teacher_name, batch_name in rows:
-        boards = boards_by_pair.get((slot.batch_id, slot.subject_id), [])
-        if not boards:
+        if (slot.batch_id, slot.subject_id) not in active_pairs:
             continue  # no active offering left for this slot's batch+subject
-        if board and board.value not in boards:
-            continue
         record = records_by_slot.get(slot.id)
         result.append(AdminTeacherAttendanceEntry(
             timetable_slot_id=slot.id,
@@ -680,7 +671,6 @@ def admin_teacher_attendance_cascade(
             end_time=slot.end_time,
             batch_id=slot.batch_id,
             batch_name=batch_name,
-            board=board.value if board else sorted(boards)[0],
             level_id=slot.level_id,
             level_code=level_code,
             subject_id=slot.subject_id,

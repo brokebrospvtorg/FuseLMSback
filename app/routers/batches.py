@@ -138,7 +138,6 @@ def get_batch_summary(
     return BatchSummaryOut(
         batch_id=batch.id,
         batch_name=batch.name,
-        board=batch.board,
         is_current=batch.is_current,
         total_active_students=len(active_student_ids),
         total_assigned_teachers=len(teacher_names),

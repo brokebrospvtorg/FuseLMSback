@@ -75,7 +75,7 @@ def _serialize(db: Session, subject: Subject) -> SubjectOut:
         primary_level = db.query(Level).filter(Level.id == subject.level_id).first()
 
     return SubjectOut(
-        id=subject.id, name=subject.name, code=subject.code, board=subject.board,
+        id=subject.id, name=subject.name, code=subject.code,
         is_active=subject.is_active, level_id=subject.level_id,
         level_name=primary_level.name if primary_level else None,
         levels=levels,

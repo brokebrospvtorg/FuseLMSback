@@ -1,6 +1,6 @@
 from app.models.user import (
     User, StudentProfile, TeacherProfile, ParentProfile, ParentStudentLink,
-    VerificationToken, CorrectionRequest, TeacherBoard, TeacherLevel, PasswordResetRequest,
+    VerificationToken, CorrectionRequest, TeacherLevel, PasswordResetRequest,
 )
 from app.models.academic import (
     Batch, Level, Subject, SubjectLevel, StudentLevelEnrollment, SubjectRequest,
@@ -18,7 +18,7 @@ from app.models.system import SystemSettings
 
 __all__ = [
     "User", "StudentProfile", "TeacherProfile", "ParentProfile", "ParentStudentLink",
-    "VerificationToken", "CorrectionRequest", "TeacherBoard", "TeacherLevel", "PasswordResetRequest",
+    "VerificationToken", "CorrectionRequest", "TeacherLevel", "PasswordResetRequest",
     "Batch", "Level", "Subject", "SubjectLevel", "StudentLevelEnrollment", "SubjectRequest",
     "Enrollment", "TeacherSubjectAssignment", "BatchSubject", "ClassSubject",
     "TimetableSlot", "AttendanceRecord",

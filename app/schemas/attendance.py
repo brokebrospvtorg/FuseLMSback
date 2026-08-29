@@ -4,8 +4,6 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel
 
-from app.schemas.common import BoardEnum
-
 # Single source of truth for attendance status input validation — matches
 # the Postgres enum `attendance_status` (app/models/enums.py::AttendanceStatus)
 # exactly. Used on every REQUEST schema that accepts a status so FastAPI
@@ -175,17 +173,6 @@ class TimetableSlotDetailOut(BaseModel):
     day_of_week: str
     start_time: time
     end_time: time
-    # Over-Inclusive Cascading Dropdowns fix: which active BatchSubject
-    # board this slot's subject+batch is actually offered under, resolved
-    # server-side — same idea as TeacherSubjectAssignmentOut.board (see
-    # that field's docstring in schemas/academic.py). Populated (and the
-    # slot fanned out once per active board) only on Teacher-scoped reads
-    # (GET /timetable/slots for a Teacher, GET /timetable/my-teaching-schedule)
-    # where a board-accurate cascade actually matters; left None on the
-    # Admin/Coordinator Interactive Timetable Builder's unfiltered listing,
-    # which intentionally still needs to see every slot regardless of
-    # offering status in order to fix ones that drifted out of sync.
-    board: Optional[BoardEnum] = None
 
 
 class CoordinatorRosterEntry(BaseModel):
@@ -229,7 +216,7 @@ class TeacherAttendanceLogEntry(BaseModel):
 class AdminTeacherAttendanceEntry(BaseModel):
     """
     One row per period on the selected date, matching the Admin Teacher
-    Attendance screen's Batch -> Board -> Level -> Subject cascade —
+    Attendance screen's Batch -> Level -> Subject cascade (Board removed) —
     mirrors CoordinatorDayWiseEntry (routers/attendance.py) but scoped to
     the assigned teacher's own attendance status for that period, not the
     student roster counts.
@@ -247,7 +234,6 @@ class AdminTeacherAttendanceEntry(BaseModel):
     end_time: time
     batch_id: uuid.UUID
     batch_name: str
-    board: str
     level_id: uuid.UUID
     level_code: Optional[str] = None
     subject_id: uuid.UUID

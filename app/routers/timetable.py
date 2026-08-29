@@ -6,28 +6,12 @@ from sqlalchemy.orm import Session, aliased
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_roles, check_license
-from app.core.offering_utils import active_boards_for, active_boards_map
+from app.core.offering_utils import has_active_offering, active_offering_pairs
 from app.core.security import guard_teacher_assignee_role
 from app.models import TimetableSlot, Enrollment, User, Subject, Batch
 from app.schemas.attendance import TimetableSlotCreate, TimetableSlotOut, TimetableSlotDetailOut, TimetableSlotUpdate
-from app.schemas.common import BoardEnum
 
 router = APIRouter(prefix="/api/timetable", tags=["timetable"], dependencies=[Depends(check_license)])
-
-
-class TimetableSlotCreateCascading(TimetableSlotCreate):
-    """
-    Extends TimetableSlotCreate with `board` — the field the Coordinator's
-    strict Batch -> Board -> Level -> Subject -> Teacher creation cascade
-    actually selects third. board is NOT a TimetableSlot column (it's a
-    batch_subjects concept — see BatchSubject's own docstring); requiring
-    it here lets create_slot validate the Coordinator's actual selection is
-    one of THIS batch+subject's active offering boards, instead of only
-    checking that *some* board is active for the pair (which let a
-    Coordinator pick a board the offering was never actually running
-    under).
-    """
-    board: BoardEnum
 
 
 def _find_teacher_time_conflict(
@@ -59,16 +43,15 @@ def _find_teacher_time_conflict(
 
 
 @router.post("/slots", response_model=TimetableSlotOut, status_code=status.HTTP_201_CREATED)
-def create_slot(payload: TimetableSlotCreateCascading, db: Session = Depends(get_db),
+def create_slot(payload: TimetableSlotCreate, db: Session = Depends(get_db),
                  current_user: User = Depends(require_roles("admin", "coordinator"))):
     """
-    Cascading Creation: enforces the full Batch -> Board -> Level -> Subject
-    -> Teacher Assignee chain. batch_id/level_id/subject_id/teacher_id are
-    already required fields on TimetableSlotCreate; `board` (added by
-    TimetableSlotCreateCascading above) is validated against the batch+
-    subject's real active offering board(s) rather than merely required to
-    be present, since a syntactically valid-but-wrong board would defeat
-    the point of the cascade.
+    Cascading Creation: enforces the Batch -> Level -> Subject -> Teacher
+    Assignee chain (Board removed) — batch_id/level_id/subject_id/
+    teacher_id are all required fields on TimetableSlotCreate, and the
+    batch+subject pair is additionally validated against
+    has_active_offering below, since a syntactically valid but unoffered
+    subject/batch would defeat the point of the cascade.
     """
     # Admin Role Isolation Guard: a TimetableSlot.teacher_id must never
     # resolve to an admin/superadmin account — checked before anything
@@ -78,18 +61,11 @@ def create_slot(payload: TimetableSlotCreateCascading, db: Session = Depends(get
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Teacher not found")
     guard_teacher_assignee_role(teacher_user.role, context="a Teacher on a Timetable Slot")
 
-    active_boards = active_boards_for(db, payload.batch_id, payload.subject_id)
-    if not active_boards:
+    if not has_active_offering(db, payload.batch_id, payload.subject_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This subject has no active offering for this batch. Offer the subject for this "
-                   "batch (and board) before scheduling a class period for it.",
-        )
-    if payload.board.value not in active_boards:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"'{payload.board.value}' is not an active offering board for this batch/subject. "
-                   f"Active board(s): {', '.join(sorted(active_boards))}.",
+                   "batch before scheduling a class period for it.",
         )
 
     # schema_update_21: a teacher can't teach two overlapping periods at
@@ -104,9 +80,7 @@ def create_slot(payload: TimetableSlotCreateCascading, db: Session = Depends(get
             detail="This teacher already has an overlapping period scheduled at that day/time.",
         )
 
-    # `board` isn't a TimetableSlot column — it only exists on this payload
-    # to be validated above, so it's excluded before constructing the row.
-    slot = TimetableSlot(**payload.model_dump(exclude={"board"}))
+    slot = TimetableSlot(**payload.model_dump())
     db.add(slot)
     db.commit()
     db.refresh(slot)
@@ -117,7 +91,6 @@ def create_slot(payload: TimetableSlotCreateCascading, db: Session = Depends(get
 def list_slots(
     batch_id: Optional[uuid.UUID] = None,
     teacher_id: Optional[uuid.UUID] = None,
-    board: Optional[BoardEnum] = None,
     level_id: Optional[uuid.UUID] = None,
     subject_id: Optional[uuid.UUID] = None,
     db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -130,25 +103,20 @@ def list_slots(
     `start_time` (no `period_number` anywhere in this codebase anymore —
     schema_update_22 dropped the column).
 
-    Timetable search cascade (Batch -> Board -> Level -> Subject ->
-    Teacher): level_id/subject_id/teacher_id/batch_id filter directly on
-    TimetableSlot's own columns. `board` does NOT — it's a batch_subjects
-    concept (see BatchSubject's docstring) — so it's applied via the same
-    active-offering lookup already used for the Teacher-scoped branch's
-    board field/fan-out below, now for every caller.
+    Timetable search cascade (Batch -> Level -> Subject -> Teacher; Board
+    removed): level_id/subject_id/teacher_id/batch_id all filter directly
+    on TimetableSlot's own columns.
 
     Over-Inclusive Cascading Dropdowns fix: when this is a Teacher looking
     at their OWN schedule (the branch that feeds the Attendance screen's
     Day-Wise cascade), every slot is additionally cross-checked against an
-    active batch_subjects offering and fanned out one row per active
-    board — same treatment as GET /academic/teacher-assignments.
-    Deliberately NOT applied to the Admin/Coordinator view of this same
-    endpoint (no batch_id/teacher_id-driven Teacher scoping, or an
-    explicit teacher_id lookup by an Admin/Coordinator) — the Interactive
-    Timetable Builder needs to see every slot, including ones that have
-    drifted out of sync with the offering, so there's something to click
-    on and fix; a `board` filter is the one exception, since a Coordinator
-    explicitly filtering by board only wants matches for that board.
+    active batch_subjects offering (has_active_offering) — same treatment
+    as GET /academic/teacher-assignments. Deliberately NOT applied to the
+    Admin/Coordinator view of this same endpoint (no batch_id/teacher_id-
+    driven Teacher scoping, or an explicit teacher_id lookup by an Admin/
+    Coordinator) — the Interactive Timetable Builder needs to see every
+    slot, including ones that have drifted out of sync with the offering,
+    so there's something to click on and fix.
     """
     teacher = aliased(User)
     query = (
@@ -174,13 +142,9 @@ def list_slots(
     # start_time is the only in-day ordering. No period_number anywhere.
     rows = query.order_by(TimetableSlot.day_of_week, TimetableSlot.start_time).all()
 
-    boards_by_pair = active_boards_map(db, ((slot.batch_id, slot.subject_id) for slot, _, _, _ in rows))
-
     if not is_self_scoped_teacher:
         result: List[TimetableSlotDetailOut] = []
         for slot, subject_name, teacher_name, batch_name in rows:
-            if board and board.value not in boards_by_pair.get((slot.batch_id, slot.subject_id), []):
-                continue
             result.append(TimetableSlotDetailOut(
                 id=slot.id, subject_id=slot.subject_id, subject_name=subject_name,
                 teacher_id=slot.teacher_id, teacher_name=teacher_name,
@@ -190,25 +154,17 @@ def list_slots(
             ))
         return result
 
+    active_pairs = active_offering_pairs(db, ((slot.batch_id, slot.subject_id) for slot, _, _, _ in rows))
     result: List[TimetableSlotDetailOut] = []
     for slot, subject_name, teacher_name, batch_name in rows:
-        boards = boards_by_pair.get((slot.batch_id, slot.subject_id), [])
-        if not boards:
+        if (slot.batch_id, slot.subject_id) not in active_pairs:
             continue  # no active offering left for this slot's batch+subject — still filtered out, same as before
-        if board and board.value not in boards:
-            continue
-        # Bug fix: a slot used to be emitted once PER active board (a
-        # subject offered under all 3 boards in the same batch rendered
-        # the same 11:00 AM Monday period 3 times on the Teacher's weekly
-        # grid). One physical period is one row, full stop. board is set
-        # to whichever offering sorts first only so the field isn't null
-        # on a Teacher-scoped read.
         result.append(TimetableSlotDetailOut(
             id=slot.id, subject_id=slot.subject_id, subject_name=subject_name,
             teacher_id=slot.teacher_id, teacher_name=teacher_name,
             batch_id=slot.batch_id, batch_name=batch_name,
             day_of_week=slot.day_of_week,
-            start_time=slot.start_time, end_time=slot.end_time, board=sorted(boards)[0],
+            start_time=slot.start_time, end_time=slot.end_time,
         ))
     return result
 
@@ -243,11 +199,11 @@ def update_slot(slot_id: uuid.UUID, payload: TimetableSlotUpdate, db: Session = 
     if "batch_id" in updates or "subject_id" in updates:
         effective_batch_id = updates.get("batch_id", slot.batch_id)
         effective_subject_id = updates.get("subject_id", slot.subject_id)
-        if not active_boards_for(db, effective_batch_id, effective_subject_id):
+        if not has_active_offering(db, effective_batch_id, effective_subject_id):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="This subject has no active offering for this batch. Offer the subject for this "
-                       "batch (and board) before moving a class period to it.",
+                       "batch before moving a class period to it.",
             )
 
     # schema_update_21: same teacher-double-booked guard as create_slot,
@@ -346,9 +302,9 @@ def my_teaching_schedule(
     sends nothing).
 
     Over-Inclusive Cascading Dropdowns fix: same active-offering
-    cross-check and per-board fan-out as the Teacher branch of GET
-    /timetable/slots — this feeds the Teacher Portal's read-only Timetable
-    screen and the Day-Wise Attendance cascade's final [Period/Date] step.
+    cross-check as the Teacher branch of GET /timetable/slots — this feeds
+    the Teacher Portal's read-only Timetable screen and the Day-Wise
+    Attendance cascade's final [Period/Date] step.
     """
     if day_of_week is not None and day_of_week.lower() not in _VALID_DAYS:
         raise HTTPException(
@@ -366,11 +322,10 @@ def my_teaching_schedule(
         query = query.filter(TimetableSlot.day_of_week == day_of_week.lower())
 
     rows = query.order_by(TimetableSlot.day_of_week, TimetableSlot.start_time).all()
-    boards_by_pair = active_boards_map(db, ((slot.batch_id, slot.subject_id) for slot, _, _ in rows))
+    active_pairs = active_offering_pairs(db, ((slot.batch_id, slot.subject_id) for slot, _, _ in rows))
     result: List[TimetableSlotDetailOut] = []
     for slot, subject_name, batch_name in rows:
-        boards = boards_by_pair.get((slot.batch_id, slot.subject_id), [])
-        if not boards:
+        if (slot.batch_id, slot.subject_id) not in active_pairs:
             continue  # no active offering left for this slot's batch+subject — still filtered out, same as before
         result.append(TimetableSlotDetailOut(
             id=slot.id,
@@ -383,7 +338,6 @@ def my_teaching_schedule(
             day_of_week=slot.day_of_week,
             start_time=slot.start_time,
             end_time=slot.end_time,
-            board=sorted(boards)[0],
         ))
     return result
 

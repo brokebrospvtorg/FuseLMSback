@@ -20,10 +20,10 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.dependencies import require_roles, check_license
 from app.core.audit import log_action
-from app.core.offering_utils import active_boards_for
+from app.core.offering_utils import has_active_offering
 from app.core.security import guard_teacher_assignee_role
 from app.models import (
-    User, TeacherProfile, TeacherBoard, TeacherLevel, Level,
+    User, TeacherProfile, TeacherLevel, Level,
     TeacherSubjectAssignment, Subject, Batch,
 )
 from app.schemas.academic import TeacherSubjectAssignmentOut
@@ -50,9 +50,10 @@ def get_teacher_workload_summary(
     app/routers/users.py already uses, so this sidebar and the existing
     Teacher-picker dropdown never disagree on who counts as a Teacher.
 
-    Assigned Boards / Levels are read straight from teacher_boards /
-    teacher_levels — neither table has a deleted_at column, so every row
-    there is, by definition, a current qualification.
+    Assigned Levels are read straight from teacher_levels — that table has
+    no deleted_at column, so every row there is, by definition, a current
+    qualification. (Assigned Boards were read the same way from
+    teacher_boards before the Board entity was removed.)
 
     "Active assigned subjects and batches" = teacher_subject_assignments
     rows with deleted_at IS NULL, inner-joined to subjects/batches that are
@@ -75,16 +76,6 @@ def get_teacher_workload_summary(
         return []
 
     teacher_ids = [user.id for user, _ in teacher_rows]
-
-    # ---- Assigned Boards ----
-    board_rows = (
-        db.query(TeacherBoard.teacher_id, TeacherBoard.board)
-        .filter(TeacherBoard.teacher_id.in_(teacher_ids))
-        .all()
-    )
-    boards_by_teacher: Dict[uuid.UUID, List[str]] = defaultdict(list)
-    for teacher_id, board in board_rows:
-        boards_by_teacher[teacher_id].append(board)
 
     # ---- Assigned Levels ----
     level_rows = (
@@ -138,7 +129,6 @@ def get_teacher_workload_summary(
             email=user.email,
             teacher_code=profile.teacher_code,
             phone_number=user.phone_number,
-            boards=boards_by_teacher.get(user.id, []),
             levels=levels_by_teacher.get(user.id, []),
             assignments=assignments,
             active_subjects_count=len({a.subject_id for a in assignments}),
@@ -212,7 +202,7 @@ def assign_subject_batch_to_teacher(
       2. subject_id / batch_id both resolve to real, non-deleted rows.
       3. The subject actually has an ACTIVE offering for this batch
          (BatchSubject) — same guard as every other assignment-creating
-         endpoint (see active_boards_for's docstring for why: without
+         endpoint (see has_active_offering's docstring for why: without
          this, the assignment would show up in the Teacher's own
          cascading dropdowns for a batch/subject that was never really
          offered, or whose offering was withdrawn).
@@ -250,12 +240,11 @@ def assign_subject_batch_to_teacher(
     if existing and existing.deleted_at is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This teacher is already assigned to this subject/batch.")
 
-    boards = active_boards_for(db, payload.batch_id, payload.subject_id)
-    if not boards:
+    if not has_active_offering(db, payload.batch_id, payload.subject_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This subject has no active offering for this batch. Offer the subject for this "
-                   "batch (and board) before assigning a teacher to it.",
+                   "batch before assigning a teacher to it.",
         )
 
     if existing:
@@ -283,7 +272,6 @@ def assign_subject_batch_to_teacher(
     return TeacherSubjectAssignmentOut(
         id=assignment.id, teacher_id=assignment.teacher_id, subject_id=assignment.subject_id,
         batch_id=assignment.batch_id, assigned_by=assignment.assigned_by, assigned_at=assignment.assigned_at,
-        board=sorted(boards)[0],
     )
 
 

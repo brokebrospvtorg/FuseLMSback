@@ -1,6 +1,6 @@
 """
 Single source of truth for "is this batch+subject combo actually an
-active offering right now" — schema_update_13/15's BatchSubject table is
+active offering right now" — schema_update_13's BatchSubject table is
 where that question is meant to be answered (see BatchSubject's own
 docstring in app/models/academic.py), but several write/read paths that
 should have deferred to it were checking Batch/Subject existence only and
@@ -16,12 +16,16 @@ never asking BatchSubject at all:
 
 Once such a row exists, every "what can this teacher see" read path that
 trusted it at face value (GET /academic/teacher-assignments, GET
-/timetable/slots, GET /timetable/my-teaching-schedule) surfaced a
-batch/board/subject the batch was never actually offering — the "empty
-batch shows up", "all three boards show up" symptoms. This module is used
-both to REJECT new assignments/slots that aren't backed by an active
-offering, and to FILTER existing ones the same way when read back for a
-Teacher.
+/timetable/slots, GET /timetable/my-teaching-schedule) surfaced a batch/
+subject the batch was never actually offering. This module is used both
+to REJECT new assignments/slots that aren't backed by an active offering,
+and to FILTER existing ones the same way when read back for a Teacher.
+
+Board removal: this module used to report which board(s) a batch+subject
+offering was active under (`active_boards_for` / `active_boards_map`),
+and callers fanned a single assignment/slot row out into one row per
+active board. Now that BatchSubject has no `board` column, "is this an
+active offering" collapses to a plain existence check — no more fan-out.
 """
 import uuid
 from typing import Iterable
@@ -31,13 +35,13 @@ from sqlalchemy.orm import Session
 from app.models import BatchSubject, Subject
 
 
-def active_boards_for(db: Session, batch_id: uuid.UUID, subject_id: uuid.UUID) -> list[str]:
-    """Every board this subject is currently actively offered under, for
-    this specific batch. Empty means "not offered here at all" (or the
-    offering was withdrawn) — the only two states an Admin/Coordinator
-    action or a Teacher-facing list should ever treat as "not usable"."""
-    rows = (
-        db.query(BatchSubject.board)
+def has_active_offering(db: Session, batch_id: uuid.UUID, subject_id: uuid.UUID) -> bool:
+    """Whether this batch currently has an active (is_active=True,
+    non-soft-deleted Subject) BatchSubject row for this subject — the
+    only state a write path (assigning a teacher, scheduling a slot) or a
+    Teacher-facing read should treat as "usable"."""
+    row = (
+        db.query(BatchSubject.id)
         .join(Subject, Subject.id == BatchSubject.subject_id)
         .filter(
             BatchSubject.batch_id == batch_id,
@@ -45,28 +49,25 @@ def active_boards_for(db: Session, batch_id: uuid.UUID, subject_id: uuid.UUID) -
             BatchSubject.is_active.is_(True),
             Subject.deleted_at.is_(None),
         )
-        .distinct()
-        .all()
+        .first()
     )
-    return [row.board for row in rows]
+    return row is not None
 
 
-def has_active_offering(db: Session, batch_id: uuid.UUID, subject_id: uuid.UUID) -> bool:
-    return len(active_boards_for(db, batch_id, subject_id)) > 0
-
-
-def active_boards_map(
+def active_offering_pairs(
     db: Session, pairs: Iterable[tuple[uuid.UUID, uuid.UUID]]
-) -> dict[tuple[uuid.UUID, uuid.UUID], list[str]]:
-    """Batch version of active_boards_for, for building N (assignment or
-    slot) rows -> their active board(s) without one query per row."""
+) -> set[tuple[uuid.UUID, uuid.UUID]]:
+    """Batch version of has_active_offering, for checking N (assignment or
+    slot) rows -> whether each has an active offering, without one query
+    per row. Returns the subset of the input pairs that DO have an active
+    offering."""
     pairs = list({p for p in pairs})
     if not pairs:
-        return {}
+        return set()
     batch_ids = {p[0] for p in pairs}
     subject_ids = {p[1] for p in pairs}
     rows = (
-        db.query(BatchSubject.batch_id, BatchSubject.subject_id, BatchSubject.board)
+        db.query(BatchSubject.batch_id, BatchSubject.subject_id)
         .join(Subject, Subject.id == BatchSubject.subject_id)
         .filter(
             BatchSubject.batch_id.in_(batch_ids),
@@ -77,7 +78,5 @@ def active_boards_map(
         .distinct()
         .all()
     )
-    result: dict[tuple[uuid.UUID, uuid.UUID], list[str]] = {}
-    for batch_id, subject_id, board in rows:
-        result.setdefault((batch_id, subject_id), []).append(board)
-    return result
+    found = {(batch_id, subject_id) for batch_id, subject_id in rows}
+    return found & set(pairs)

@@ -3,8 +3,6 @@ from typing import List, Optional
 
 from pydantic import BaseModel
 
-from app.schemas.common import BoardEnum
-
 
 class TeacherWorkloadLevelOut(BaseModel):
     level_id: uuid.UUID
@@ -29,7 +27,6 @@ class TeacherWorkloadSummaryOut(BaseModel):
     email: str
     teacher_code: Optional[str] = None
     phone_number: Optional[str] = None
-    boards: List[BoardEnum] = []
     levels: List[TeacherWorkloadLevelOut] = []
     assignments: List[TeacherWorkloadAssignmentOut] = []
     # Convenience counts so the sidebar's badge/summary chips don't need to

@@ -1,9 +1,9 @@
-from sqlalchemy import Column, Text, ForeignKey, TIMESTAMP, Date, Integer, Boolean, text
+from sqlalchemy import Column, Text, ForeignKey, TIMESTAMP, Date, Integer, Boolean, text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.core.database import Base
 from app.models.enums import (
-    BatchSession, LevelEnrollmentStatus, SubjectRequestStatus, EnrollmentStatus, Board,
+    BatchSession, LevelEnrollmentStatus, SubjectRequestStatus, EnrollmentStatus,
 )
 
 
@@ -17,17 +17,6 @@ class Batch(Base):
     start_date = Column(Date, nullable=False)
     end_date = Column(Date, nullable=False)
     is_current = Column(Boolean, nullable=False, server_default="false")
-    # schema_update_11: the examining board a Batch is created under.
-    # Required (NOT NULL) for every Batch, but schema_update_15 downgrades
-    # what this column MEANS: a Batch is not restricted to this one board —
-    # it's just the default/originating board captured at creation time
-    # (and editable via PUT .../batches/{id} for when Admin picked wrong).
-    # Whether a Batch has real activity under British Council, Edexcel,
-    # and/or LRN is answered by BatchSubject.board below, not this column —
-    # do not filter/gate batch visibility by this field (see
-    # routers/academic.py list_batches' active_boards and
-    # admin-batches.component.ts).
-    board = Column(Board, nullable=False)
     # schema_update_13: "is this batch open for admin work" — assigning
     # teachers, offering subjects, taking subject requests — independent of
     # is_current above (see that migration's comment for the distinction).
@@ -77,7 +66,6 @@ class Subject(Base):
     name = Column(Text, nullable=False)
     code = Column(Text, nullable=False)
     level_id = Column(UUID(as_uuid=True), ForeignKey("levels.id"), nullable=False)
-    board = Column(Board, nullable=True)
     is_active = Column(Boolean, nullable=False, server_default="true")
     deleted_at = Column(TIMESTAMP(timezone=True))
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
@@ -168,19 +156,19 @@ class BatchSubject(Base):
     summary, but can't answer "what should show up in the request
     dropdown before anyone's enrolled," which is the actual bug this fixes.
 
-    schema_update_15: `board` records which examining Board this specific
-    offering is under. A Batch is NOT restricted to a single Board (see
-    Batch.board's own docstring) — the same catalog Subject can be offered
-    more than once in the same batch, once per Board it's actually running
-    under here (unique on batch_id+subject_id+board, not just
-    batch_id+subject_id). This is the column that makes "is this batch
-    active under Edexcel" answerable at all.
+    board removal: BatchSubject used to carry `board`, and uniqueness was
+    on (batch_id, subject_id, board) so the same catalog Subject could be
+    offered more than once per batch (once per board). Now that board is
+    gone, uniqueness is plain (batch_id, subject_id) — see
+    idx_batch_subjects_batch_subject in the board-removal migration.
     """
     __tablename__ = "batch_subjects"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "subject_id", name="idx_batch_subjects_batch_subject"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     batch_id = Column(UUID(as_uuid=True), ForeignKey("batches.id"), nullable=False)
     subject_id = Column(UUID(as_uuid=True), ForeignKey("subjects.id"), nullable=False)
-    board = Column(Board, nullable=False)
     is_active = Column(Boolean, nullable=False, server_default="true")
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
